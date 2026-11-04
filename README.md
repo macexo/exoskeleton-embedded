@@ -1,68 +1,81 @@
 # McMaster Exoskeleton - Embedded Code
 
-Embedded firmware for the McMaster Exoskeleton project. This repository contains hardware APIs and test projects for the sensors and motors used in the exoskeleton system, targeting STM32 Nucleo-F446RE development boards.
+Embedded firmware and Raspberry Pi software for the McMaster Exoskeleton project. This repository contains STM32 applications, reusable hardware APIs, and standalone sensor and motor experiments, including projects for Nucleo-F446RE development boards.
 
 ## Getting Started
 
-All active test projects live under the `stm32-tests/` folder. Each project is a standalone STM32CubeIDE project that can be opened, built, and flashed independently. Every project includes:
+For the November SPI workshop, follow [NOVEMBER_WORKSHOP.md](NOVEMBER_WORKSHOP.md).
 
-- A `docs/` folder with API reference and testing instructions
-- A `scripts/` folder with Python scripts for UART-based testing from your computer
+Use `src/` for application integration, `apis/` for reusable drivers and interfaces, `testing/` for standalone hardware experiments, and `workshops/` for learning exercises and member submissions.
 
-Pick the project you need below and follow its testing instructions to get up and running.
+Follow each project's README or local testing instructions for its tools, board, wiring, and validation steps. Hardware experiments from previous development remain available as references. Project folders may include:
+
+- `docs/` -- API references and hardware testing instructions
+- `scripts/` -- host-side helpers, such as Python tools for UART testing
 
 ## Project Structure
 
-```
+```text
 exoskeleton-embedded/
-├── stm32-tests/
-│   ├── sensor-testing/          <-- IMU (LSM6DS3TR-C) test project
-│   │   ├── docs/
-│   │   │   ├── lsm6ds3tr-api.md         # IMU driver API reference
-│   │   │   └── testing-instructions.md  # How to set up and test the IMU
-│   │   ├── scripts/
-│   │   │   └── imu_uart_test.py         # Python script for IMU testing over UART
-│   │   └── Core/                        # STM32CubeIDE source (firmware)
-│   │
-│   └── motor-api-tests/         <-- Motor (AK70-9) test project
-│       ├── docs/
-│       │   ├── ak70-9-api.md            # Motor CAN API reference
-│       │   └── testing-instructions.md  # How to set up and test the motor
-│       ├── scripts/
-│       │   └── motor_test.py            # Python script for motor testing over UART
-│       └── Core/                        # STM32CubeIDE source (firmware)
-│
-├── CONTRIBUTING.md              # Contribution guidelines and coding standards
-└── README.md                    # This file
+├── apis/                        # Reusable sensor, motor, and CAN interfaces
+├── src/
+│   ├── stm32/                   # STM32 application projects
+│   └── pi/                      # Raspberry Pi application code
+├── testing/
+│   ├── stm32/                   # Standalone STM32 hardware experiments
+│   │   ├── sensor-testing/      # LSM6DS3TR-C IMU testing over I2C
+│   │   │   ├── docs/
+│   │   │   │   ├── lsm6ds3tr-api.md
+│   │   │   │   └── testing-instructions.md
+│   │   │   ├── scripts/
+│   │   │   │   └── imu_uart_test.py
+│   │   │   └── Core/            # STM32CubeIDE firmware source
+│   │   └── motor-api-tests/     # AK70-9 motor testing over CAN
+│   │       ├── docs/
+│   │       │   ├── ak70-9-api.md
+│   │       │   └── testing-instructions.md
+│   │       ├── scripts/
+│   │       │   └── motor_test.py
+│   │       └── Core/            # STM32CubeIDE firmware source
+│   ├── discovery/               # Discovery-board experiments
+│   └── pi/                      # Raspberry Pi experiments
+├── workshops/                   # Assignments, starters, and member submissions
+├── CONTRIBUTING.md              # Contribution guidelines
+├── NOVEMBER_WORKSHOP.md         # November SPI workshop member guide
+└── README.md
 ```
 
-## Active Projects
+## Hardware Test Projects
 
 ### sensor-testing -- IMU Testing
 
 Tests the **LSM6DS3TR-C** 6-axis IMU (accelerometer + gyroscope) over I2C. The Nucleo board reads sensor data continuously and exposes it over UART so you can query values from your computer using the Python script.
 
 **Quick start:**
-1. Open `stm32-tests/sensor-testing` in STM32CubeIDE and flash the firmware.
+
+1. Follow the project instructions to import `testing/stm32/sensor-testing` into STM32CubeIDE, build, and flash the firmware.
 2. Run `python scripts/imu_uart_test.py` to send commands and read sensor data.
-3. See [`docs/testing-instructions.md`](stm32-tests/sensor-testing/docs/testing-instructions.md) for full setup and wiring details.
-4. See [`docs/lsm6ds3tr-api.md`](stm32-tests/sensor-testing/docs/lsm6ds3tr-api.md) for the driver API reference.
+3. See [`docs/testing-instructions.md`](testing/stm32/sensor-testing/docs/testing-instructions.md) for full setup and wiring details.
+4. See [`docs/lsm6ds3tr-api.md`](testing/stm32/sensor-testing/docs/lsm6ds3tr-api.md) for the driver API reference.
 
 ### motor-api-tests -- Motor Testing
 
 Tests the **CubeMars AK70-9** brushless motor over CAN bus. The Nucleo board sends motor commands and receives motor feedback, with a UART telemetry interface for monitoring from your computer using the Python script.
 
 **Quick start:**
-1. Open `stm32-tests/motor-api-tests` in STM32CubeIDE and flash the firmware.
+
+1. Follow the project instructions to import `testing/stm32/motor-api-tests` into STM32CubeIDE, build, and flash the firmware.
 2. Run `python scripts/motor_test.py` to send commands and read motor telemetry.
-3. See [`docs/testing-instructions.md`](stm32-tests/motor-api-tests/docs/testing-instructions.md) for full setup, wiring, and CAN transceiver details.
-4. See [`docs/ak70-9-api.md`](stm32-tests/motor-api-tests/docs/ak70-9-api.md) for the motor CAN API reference.
+3. See [`docs/testing-instructions.md`](testing/stm32/motor-api-tests/docs/testing-instructions.md) for full setup, wiring, and CAN transceiver details.
+4. See [`docs/ak70-9-api.md`](testing/stm32/motor-api-tests/docs/ak70-9-api.md) for the motor CAN API reference.
 
-## Prerequisites
+## Tools and Hardware
 
-- **STM32CubeIDE** -- for building and flashing firmware
-- **Python 3.6+** with `pyserial` (`pip install pyserial`) -- for running test scripts
-- **Nucleo-F446RE** board connected via USB
+Requirements depend on the project. For the hardware test projects described above:
+
+- **STM32CubeIDE** -- for building and debugging firmware; **STM32CubeMX** for generating or updating board/peripheral configuration
+- **Python 3** with `pyserial` (`pip install pyserial`) -- for the UART test scripts
+- **Nucleo-F446RE**, the relevant sensor or motor hardware, and project-specific connections
 
 ## Contributing
 
