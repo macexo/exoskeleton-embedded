@@ -1,4 +1,5 @@
-#include "imu_spi.h"
+#include "../../firmware/Core/Inc/imu_spi.h"
+#include <stdint.h>
 
 static int valid_device(const imu_device_t *imu)
 {
@@ -38,7 +39,19 @@ imu_status_t imu_check_identity(const imu_device_t *imu)
      * - Return any read error immediately.
      * - Return IMU_OK for 0x6C; otherwise return IMU_ERROR_IDENTITY.
      */
-    return IMU_NOT_IMPLEMENTED;
+
+    uint8_t identity;
+    imu_status_t result;
+
+    result= imu_read_register(imu, 0x0F, &identity);
+    if(result!= IMU_OK){
+        return result; // error type returned in imu_read_register
+    }
+
+    
+    
+
+    return identity == 0x6C ? IMU_OK : IMU_ERROR_IDENTITY;
 }
 
 /* Next: adapt the worked read to send a register address and its new value. */
