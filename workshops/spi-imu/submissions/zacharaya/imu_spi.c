@@ -38,7 +38,20 @@ imu_status_t imu_check_identity(const imu_device_t *imu)
      * - Return any read error immediately.
      * - Return IMU_OK for 0x6C; otherwise return IMU_ERROR_IDENTITY.
      */
-    return IMU_NOT_IMPLEMENTED;
+
+    uint8_t identity = 0;
+    imu_status_t status;
+
+    status = imu_read_register(imu, 0x0F, &identity);
+
+    if (status != IMU_OK) {
+        return status;
+    }
+
+    if (identity == 0x6C) {
+        return IMU_OK;
+    }
+    return IMU_ERROR_IDENTITY;
 }
 
 /* Next: adapt the worked read to send a register address and its new value. */
@@ -53,6 +66,21 @@ imu_status_t imu_write_register(const imu_device_t *imu, uint8_t reg, uint8_t va
      * - Hold CS low for the entire transfer; release it even on failure.
      * - Return IMU_OK on HAL_OK, otherwise IMU_ERROR_TRANSFER.
      */
+
+    uint8_t tx[2] = {reg & 0x7Fu, value};
+    uint8_t rx[2] = {0};
+
+    HAL_StatusTypeDef hal_status;
+
+    HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_RESET);
+
+    hal_status = HAL_SPI_TransmitReceive(imu->spi, tx, rx, 2, HAL_MAX_DELAY);
+
+    HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_SET);
+
+    if (hal_status == HAL_OK) {
+        return IMU_OK;
+    }
     (void)value;
-    return IMU_NOT_IMPLEMENTED;
+    return IMU_ERROR_TRANSFER;
 }
