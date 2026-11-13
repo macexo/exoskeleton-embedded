@@ -1,6 +1,6 @@
 #ifndef WORKSHOP_IMU_SPI_H
 #define WORKSHOP_IMU_SPI_H
-
+#include <stdint.h>
 #include "stm32f4xx_hal.h"
 
 typedef enum {

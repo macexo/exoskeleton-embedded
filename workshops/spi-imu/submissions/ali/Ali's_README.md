@@ -1,14 +1,17 @@
-# SPI IMU submission: YOUR_NAME
+# SPI IMU submission: ali
 
 Keep this short and link it from your individual PR. This week covers LSM6DSO32 identity checking (`0x6C`) and register writing only.
 
 ## Implementation and questions
 
-- `imu_check_identity()` — completed / remaining:
-- `imu_write_register()` — completed / remaining:
-- Datasheet sections and reasons for read/write or error-handling choices:
-- Worked read: why bit 7, a dummy byte, `rx[1]`, and one CS assertion?
-- Blockers or questions to bring to the workshop:
+- `imu_check_identity()` — completed 
+- `imu_write_register()` — completed 
+
+
+write register: Bitwise AND every value of reg with 01111111 (0x7F), to CLEAR msb 7. Bit 7 denotes the read/write flag of a uint8_t variable. 1:read, 0:write. We are writing on reg
+
+
+HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_RESET); -- HAL_GPIO_WritePin sends GPIO_PIN_RESET to imu IO, this sets CS to low (like an SR latch) 
 
 ## Workshop results
 
