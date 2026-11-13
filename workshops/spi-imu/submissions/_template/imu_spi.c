@@ -66,6 +66,19 @@ imu_status_t imu_write_register(const imu_device_t *imu, uint8_t reg, uint8_t va
      * - Hold CS low for the entire transfer; release it even on failure.
      * - Return IMU_OK on HAL_OK, otherwise IMU_ERROR_TRANSFER.
      */
-    (void)value;
-    return IMU_NOT_IMPLEMENTED;
+
+    uint8_t tx[2]={reg & 0x7F, value};
+    // Bitwise AND every value of reg with 01111111, to CLEAR msb 7. Bit 7 denotes the read/write flag of a uint8_t variable. 1:read, 0:write. We are writing on reg
+    uint8_t rx[2]={0};
+
+    HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_RESET);   //Reset sets CS to low like an SR latch
+    HAL_StatusTypeDef result= HAL_SPI_TransmitReceive(imu->spi, &tx[0], &rx[0], sizeof(uint16_t), 100); //Complete entire transfer
+    
+    HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_SET); // Release CS, unconditionally
+    
+    if(result==HAL_OK)
+        return IMU_OK;
+    else    
+        return IMU_ERROR_TRANSFER;
+
 }
