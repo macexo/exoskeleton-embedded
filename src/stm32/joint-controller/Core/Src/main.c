@@ -1,34 +1,35 @@
 /* USER CODE BEGIN Header */
 /**
- ******************************************************************************
- * @file           : main.c
- * @brief          : Main program body
- ******************************************************************************
- * @attention
- *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
- *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
- *
- ******************************************************************************
- */
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "lsm6ds3tr.h"
+#include "can.h"
+#include "spi.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <string.h>
-#include <stdarg.h>
 #include "can_common.h"
-#include "can_imu.h"
 #include "can_motor.h"
 #include "can/ak70_9.h"
+#include "lsm6dso32_reg.h"
+#include "lsm6dso32_port.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,21 +39,48 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/*
- * Per-board configuration. Change before flashing each joint.
- *   Left Hip = 1, Right Hip = 2, Left Knee = 3, Right Knee = 4
- */
-#define MY_NODE_ID          4
-#define MY_MOTOR_CAN_ID     107
+/* Which joint this board is. Set it here, or per board with a preprocessor
+   symbol such as NODE_ID=CAN_NODE_RIGHT_HIP (one CubeIDE build configuration
+   per board). A plain number 1..4 also works */
+#ifndef NODE_ID
+#define NODE_ID              CAN_NODE_RIGHT_KNEE
+#endif
 
-/* AK70-9 KV60: torque = Kt * gear_ratio * Iq -> Iq = torque / KT_EFFECTIVE */
-#define AK70_9_KT           0.159f
-#define AK70_9_GEAR_RATIO   9.0f
-#define KT_EFFECTIVE        (AK70_9_KT * AK70_9_GEAR_RATIO)
+#if (NODE_ID < CAN_NODE_LEFT_HIP) || (NODE_ID > CAN_NODE_RIGHT_KNEE)
+#error "NODE_ID must be one of the CAN_NODE_* joints (1..4)"
+#endif
 
-#define CURRENT_REFRESH_MS  50      /* prevents VESC current-loop timeout */
-#define CURRENT_LIMIT       5.0f    /* test-safe current clamp (A) */
-#define IMU_PERIOD_MS       2       /* 500 Hz IMU send */
+/* Same 11-bit layout as the joint controller's can_common.h:
+     bits [10:7] message type, [6:4] source node, [3:0] destination (0 = Pi)
+   Payload is this project's raw-count format, not the joint controller's */
+/* Zero reserves a telemetry-only build for boards without a motor assignment. */
+#ifndef JOINT_MOTOR_ID
+#if NODE_ID == CAN_NODE_RIGHT_KNEE
+#define JOINT_MOTOR_ID 107
+#else
+#define JOINT_MOTOR_ID 0
+#endif
+#endif
+#if JOINT_MOTOR_ID < 0 || JOINT_MOTOR_ID > 255
+#error "JOINT_MOTOR_ID must fit in one CAN address byte"
+#endif
+#define CURRENT_LIMIT_A       5.0f
+#define TORQUE_PER_AMP        (0.159f * 9.0f)
+#define CURRENT_REFRESH_MS    50U
+#define COMMAND_TIMEOUT_MS    200U
+
+#define IMU_ACCEL_CAN_ID     CAN_BUILD_ID(CAN_MSG_IMU_ACCEL, NODE_ID, CAN_NODE_PI)
+#define IMU_GYRO_CAN_ID      CAN_BUILD_ID(CAN_MSG_IMU_GYRO, NODE_ID, CAN_NODE_PI)
+
+#define CAN_TX_TIMEOUT_MS    3U       // An 8-byte frame takes ~0.13 ms; retries after lost arbitration fit well inside this
+#define NODE_BLINK_ON_MS     150U     // Startup: LED1 flashes NODE_ID times so you can tell boards apart
+#define NODE_BLINK_OFF_MS    350U
+#define IMU_BOOT_TIME_MS     35U      // Datasheet turn-on time
+#define IMU_RESET_TIMEOUT_MS 100U     // Ceiling on the software-reset flag poll
+#define IMU_STALE_TIMEOUT_MS 100U     // LED1 goes solid if no sample arrives for this long
+#define LED_BLINK_MS         500U     // LED1 toggle period while pairs are being ACKed
+#define ERROR_BLINK_LOOPS    2000000U // Busy-wait count per LED toggle in Error_Handler (roughly 0.1 s at 180 MHz)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,219 +89,464 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-CAN_HandleTypeDef hcan1;
-
-I2C_HandleTypeDef hi2c3;
-DMA_HandleTypeDef hdma_i2c3_rx;
-
-UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-static MotorStatus motor_status      = {0};
-static float      active_current     = 0.0f;
-static uint8_t    motor_active       = 0;
-static uint8_t    estop_active       = 0;
-static uint32_t   last_refresh_tick  = 0;
-static uint32_t   ext_rx_count       = 0;
-static uint8_t    origin_set         = 0;   /* zeroed on first VESC feedback frame */
+/* Must outlive the ctx: lsm6dso32_spi_ctx() keeps a pointer to it. */
+static lsm6dso32_spi_bus_t imu_bus = { &hspi3, IMU_CS_GPIO_Port, IMU_CS_Pin };
+static stmdev_ctx_t imu;
+
+static uint16_t imu_sequence;
+static uint32_t last_sample_tick;
+static uint32_t last_blink_tick;
+
+/* Set by the INT1 (gyro data-ready) EXTI callback, cleared by imu_stream() */
+static volatile uint8_t imu_drdy;
+
+/* Inspect these in the debugger. CAN ESR includes LEC, TEC, REC and bus-off. */
+volatile const uint8_t node_id = NODE_ID; // Confirms which node a connected board was built as
+volatile uint8_t  imu_whoami;
+volatile uint32_t imu_drdy_overruns; // INT1 fired again before the last sample was taken
+volatile uint32_t imu_samples;
+volatile uint32_t imu_read_errors;
+volatile uint32_t can_pairs_sent;
+volatile uint32_t can_pairs_dropped;
+volatile uint32_t can_last_esr;
+volatile uint32_t can_last_tsr;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_CAN1_Init(void);
-static void MX_I2C3_Init(void);
 /* USER CODE BEGIN PFP */
-static void CAN_Send_IMU_Data(void);
+static void node_id_blink(void);
+static void imu_init(void);
+static void imu_stream(void);
+static void imu_pack_frame(uint8_t *out, uint16_t sequence, const int16_t *axes);
+static HAL_StatusTypeDef CAN_Send_Frame(uint32_t id, const uint8_t *data);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static float clampf(float val, float lo, float hi)
+
+static float requested_current;
+static uint32_t last_command_tick;
+static uint32_t last_current_tick;
+static uint8_t current_due;
+static uint8_t estop_latched;
+static uint8_t reset_pending;
+
+static void stop_motor(void)
 {
-  if (val < lo) return lo;
-  if (val > hi) return hi;
-  return val;
+  /* Cancel queued nonzero commands, including a mailbox retrying on bus loss. */
+  HAL_CAN_AbortTxRequest(&hcan1, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+  requested_current = 0;
+  current_due = 1;
 }
 
-static void debug_print(const char *msg)
+/* Feedback and MOTOR_STATUS use the same fixed-point scales with opposite
+   byte order. Forward the integer samples exactly, including fault codes. */
+static void motor_feedback(const CanFrame *frame, uint32_t now)
 {
-  HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)strlen(msg), 50);
+  static uint8_t origin_set;
+  static uint8_t status_sent;
+  static uint8_t last_error;
+  static uint32_t last_status_tick;
+  if (frame->id != (0x900U | JOINT_MOTOR_ID) || frame->dlc != 8) return;
+  if (!origin_set)
+    origin_set = comm_can_set_origin(JOINT_MOTOR_ID, 0);
+  if (status_sent && now - last_status_tick < 50U && last_error == frame->data[7]) return;
+  uint8_t status[8] = {
+    frame->data[1], frame->data[0], frame->data[3], frame->data[2],
+    frame->data[5], frame->data[4], frame->data[6], frame->data[7]
+  };
+  if (can_send_std(CAN_BUILD_ID(CAN_MSG_MOTOR_STATUS, NODE_ID, CAN_NODE_PI), status, 8)) {
+    status_sent = 1;
+    last_error = status[7];
+    last_status_tick = now;
+  }
 }
 
-static void debug_printf(const char *fmt, ...)
+static void motor_service(void)
 {
-  char buf[128];
-  va_list args;
-  va_start(args, fmt);
-  int n = vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+  if (!JOINT_MOTOR_ID) return;
+  CanFrame frame;
+  uint32_t now = HAL_GetTick();
+  if (__HAL_CAN_GET_FLAG(&hcan1, CAN_FLAG_FOV0)) {
+    __HAL_CAN_CLEAR_FLAG(&hcan1, CAN_FLAG_FOV0);
+    estop_latched = 1;
+    stop_motor();
+  }
+  for (unsigned n = 0; n < 6 && can_recv(&frame); ++n) {
+    if (frame.is_extended) {
+      if (!reset_pending) motor_feedback(&frame, now);
+      continue;
+    }
+    if (frame.id == CAN_ID_GLOBAL_RESET || can_get_msg_type(frame.id) == CAN_MSG_ESTOP) {
+      reset_pending |= frame.id == CAN_ID_GLOBAL_RESET;
+      estop_latched = 1;
+      stop_motor();
+    } else if (!estop_latched && frame.dlc == 2) {
+      float torque;
+      if (can_parse_torque_cmd(&frame, &torque)) {
+        if (torque == 0) {
+          stop_motor();
+        } else {
+          requested_current = torque / TORQUE_PER_AMP;
+          if (requested_current > CURRENT_LIMIT_A) requested_current = CURRENT_LIMIT_A;
+          if (requested_current < -CURRENT_LIMIT_A) requested_current = -CURRENT_LIMIT_A;
+          current_due = 1;
+        }
+        last_command_tick = now;
+      }
+    }
+  }
+  if (requested_current && now - last_command_tick >= COMMAND_TIMEOUT_MS) stop_motor();
+  if (current_due || (requested_current && now - last_current_tick >= CURRENT_REFRESH_MS)) {
+    if (comm_can_set_current(JOINT_MOTOR_ID, requested_current)) {
+      current_due = 0;
+      last_current_tick = now;
+    }
+  }
+  if (reset_pending && !current_due && HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 3)
+    NVIC_SystemReset();
 }
+
+/**
+  * @brief  Data-ready interrupt from the sensor's INT1 pin. Only raises a
+  *         flag: SPI and CAN work stays in the main loop.
+  * @param  GPIO_Pin  Pin whose EXTI line fired
+  * @retval None
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == IMU_INT1_Pin) {
+    if (imu_drdy)
+      imu_drdy_overruns++;
+    imu_drdy = 1;
+  }
+}
+
+/**
+  * @brief  Flashes LED1 NODE_ID times, then leaves it off. Run once at
+  *         startup: with four identical PCBs, this is how you check which
+  *         firmware build a board is running without a debugger. A fixed
+  *         count, so it cannot be mistaken for Error_Handler's endless
+  *         fast blink.
+  * @retval None
+  */
+static void node_id_blink(void)
+{
+  /* Reads node_id rather than NODE_ID so the linker keeps it for the debugger */
+  for (uint32_t i = 0; i < node_id; i++) {
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    HAL_Delay(NODE_BLINK_ON_MS);
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+    HAL_Delay(NODE_BLINK_OFF_MS);
+  }
+}
+
+/**
+  * @brief  Brings the LSM6DSO32 up on SPI3: confirms the sensor is responsive,
+  *         restores a known register state, locks the bus to SPI, then sets
+  *         the output ranges and data rates.
+  * @retval None (traps in Error_Handler if any step fails)
+  */
+static void imu_init(void)
+{
+  uint8_t whoami = 0;
+  uint8_t rst = 1;
+
+  /* Constructor drives the chip select line idle-high */
+  imu = lsm6dso32_spi_ctx(&imu_bus);
+
+  /* Allow sensor turn-on time before the first transaction */
+  HAL_Delay(IMU_BOOT_TIME_MS);
+
+  /* Read imu_whoami in the debugger -- on a new board the value points at the
+     fault:
+       0x00        MISO stuck low: not connected, or sensor not driving it
+       0xFF        MISO floating high: CS not reaching the sensor, or no power
+       0xD8 / 0x36 0x6C shifted by a bit: stray clock edge, check CPOL/CPHA
+       other       wrong part, or a short on the bus */
+  int32_t id_status = lsm6dso32_device_id_get(&imu, &whoami);
+
+  imu_whoami = whoami;
+
+  if (id_status != 0 || whoami != LSM6DSO32_ID)
+    Error_Handler();
+
+  /* Software reset, then wait for sensor to clear the flag. Bounded so a bus
+     dropout here traps instead of hanging silently */
+  if (lsm6dso32_reset_set(&imu, PROPERTY_ENABLE) != 0)
+    Error_Handler();
+
+  uint32_t reset_start = HAL_GetTick();
+
+  do {
+    if (lsm6dso32_reset_get(&imu, &rst) != 0 ||
+        HAL_GetTick() - reset_start >= IMU_RESET_TIMEOUT_MS)
+      Error_Handler();
+  } while (rst);
+
+  /* Disable I2C and set the 4-wire mode for SPI. With block data update on,
+     output registers are not updated until both MSB and LSB have been read.
+     Scale factors in the README must match these ranges */
+  if (lsm6dso32_i2c_interface_set(&imu, LSM6DSO32_I2C_DISABLE) != 0 ||
+      lsm6dso32_spi_mode_set(&imu, LSM6DSO32_SPI_4_WIRE) != 0 ||
+      lsm6dso32_auto_increment_set(&imu, PROPERTY_ENABLE) != 0 ||
+      lsm6dso32_block_data_update_set(&imu, PROPERTY_ENABLE) != 0 ||
+      lsm6dso32_xl_full_scale_set(&imu, LSM6DSO32_16g) != 0 ||
+      lsm6dso32_gy_full_scale_set(&imu, LSM6DSO32_2000dps) != 0 ||
+      lsm6dso32_xl_data_rate_set(&imu, LSM6DSO32_XL_ODR_417Hz_HIGH_PERF) != 0 ||
+      lsm6dso32_gy_data_rate_set(&imu, LSM6DSO32_GY_ODR_417Hz_HIGH_PERF) != 0)
+    Error_Handler();
+
+  /* Low-pass the accelerometer with LPF2 (corner ODR/20, ~21 Hz at 417 Hz) and
+     the gyro with LPF1 (AGGRESSIVE is 24.6 Hz at 417 Hz, see the LPF1 table in
+     the datasheet). Both corners depend on the ODR, so revisit them if it
+     changes. Settling mask suppresses the filter transient after reset */
+  if (lsm6dso32_xl_filter_lp2_set(&imu, PROPERTY_ENABLE) != 0 ||
+      lsm6dso32_xl_hp_path_on_out_set(&imu, LSM6DSO32_LP_ODR_DIV_20) != 0 ||
+      lsm6dso32_gy_filter_lp1_set(&imu, PROPERTY_ENABLE) != 0 ||
+      lsm6dso32_gy_lp1_bandwidth_set(&imu, LSM6DSO32_AGGRESSIVE) != 0 ||
+      lsm6dso32_filter_settling_mask_set(&imu, PROPERTY_ENABLE) != 0)
+    Error_Handler();
+
+  /* Route only gyro data-ready to INT1 (routing drdy_xl too would give two
+     edges per sample, since the two paths are not bit-aligned). Pulsed rather
+     than latched, so a missed edge cannot leave the line stuck high */
+  lsm6dso32_pin_int1_route_t int1 = {0};
+
+  int1.int1_ctrl.int1_drdy_g = PROPERTY_ENABLE;
+
+  if (lsm6dso32_pin_int1_route_set(&imu, &int1) != 0 ||
+      lsm6dso32_data_ready_mode_set(&imu, LSM6DSO32_DRDY_PULSED) != 0)
+    Error_Handler();
+}
+
+/**
+  * @brief  Sends one accel frame and one gyro frame per INT1 data-ready
+  *         interrupt. Returns immediately when the flag is clear, so the
+  *         sensor sets the pace and no SPI traffic happens until a sample
+  *         actually exists.
+  *
+  *         LED1 toggles every LED_BLINK_MS while pairs are being ACKed. It is
+  *         solid on after a failed send or read, or if samples stop arriving.
+  * @retval None
+  */
+static void imu_stream(void)
+{
+  int16_t raw_xl[3];
+  int16_t raw_gy[3];
+  uint8_t xl_frame[8];
+  uint8_t gy_frame[8];
+
+  /* No interrupt yet. SysTick still wakes the loop every 1 ms, so a dead
+     INT1 line or stalled sensor is caught here */
+  if (!imu_drdy) {
+    if (HAL_GetTick() - last_sample_tick >= IMU_STALE_TIMEOUT_MS)
+      HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    return;
+  }
+  imu_drdy = 0;
+
+  /* Reading the output registers is what clears the data-ready flags and
+     releases the BDU hold for the next sample. Failed reads are never sent */
+  if (lsm6dso32_acceleration_raw_get(&imu, raw_xl) != 0 ||
+      lsm6dso32_angular_rate_raw_get(&imu, raw_gy) != 0) {
+    imu_read_errors++;
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    return;
+  }
+
+  imu_samples++;
+  last_sample_tick = HAL_GetTick();
+
+  imu_pack_frame(xl_frame, imu_sequence, raw_xl);
+  imu_pack_frame(gy_frame, imu_sequence, raw_gy);
+  imu_sequence++; // Advance even on loss so the receiver can count missing pairs
+
+  if (CAN_Send_Frame(IMU_ACCEL_CAN_ID, xl_frame) == HAL_OK &&
+      CAN_Send_Frame(IMU_GYRO_CAN_ID, gy_frame) == HAL_OK) {
+    can_pairs_sent++;
+
+    if (HAL_GetTick() - last_blink_tick >= LED_BLINK_MS) {
+      last_blink_tick = HAL_GetTick();
+      HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    }
+  } else {
+    can_pairs_dropped++;
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+  }
+}
+
+/**
+  * @brief  Packs one reading into a CAN payload, all fields little endian:
+  *           bytes 0..1  uint16 sequence
+  *           bytes 2..7  int16 X, Y, Z in raw sensor counts
+  * @retval None
+  */
+static void imu_pack_frame(uint8_t *out, uint16_t sequence, const int16_t *axes)
+{
+  out[0] = (uint8_t)sequence;
+  out[1] = (uint8_t)(sequence >> 8);
+
+  for (int i = 0; i < 3; i++) {
+    uint16_t axis = (uint16_t)axes[i];
+
+    out[2 + (2 * i)] = (uint8_t)axis;
+    out[3 + (2 * i)] = (uint8_t)(axis >> 8);
+  }
+}
+
+/**
+  * @brief  Sends one standard-ID, 8-byte frame and waits for it to finish.
+  *         Automatic retransmission is on (NART = 0), so the hardware keeps
+  *         retrying after lost arbitration or a bus error. CAN_TX_TIMEOUT_MS
+  *         bounds those retries, e.g. when no other node is powered to ACK.
+  *         CAN TX interrupts must stay off alongside this polling.
+  * @retval HAL_OK only if another node ACKed the frame. On a shared bus that
+  *         can be another IMU board, so it does not prove the Pi received it
+  */
+static HAL_StatusTypeDef CAN_Send_Frame(uint32_t id, const uint8_t *data)
+{
+  CAN_TxHeaderTypeDef TxHeader = {0};
+  uint32_t TxMailbox = 0;
+
+  TxHeader.StdId = id;
+  TxHeader.IDE   = CAN_ID_STD;
+  TxHeader.RTR   = CAN_RTR_DATA;
+  TxHeader.DLC   = 8;
+
+  // Queue CAN frame if there's a free mailbox
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0 ||
+      HAL_CAN_AddTxMessage(&hcan1, &TxHeader, data, &TxMailbox) != HAL_OK)
+    return HAL_ERROR;
+
+  // Wait for the transmission (including any hardware retries) to finish
+  uint32_t start = HAL_GetTick();
+
+  while (HAL_CAN_IsTxMessagePending(&hcan1, TxMailbox)) {
+    if (HAL_GetTick() - start >= CAN_TX_TIMEOUT_MS) {
+      HAL_CAN_AbortTxRequest(&hcan1, TxMailbox);
+      can_last_esr = hcan1.Instance->ESR;
+      can_last_tsr = hcan1.Instance->TSR;
+      return HAL_TIMEOUT;
+    }
+  }
+
+  // TXOK is only set if the frame went out and was ACKed by another node
+  uint32_t txok_bit = (TxMailbox == CAN_TX_MAILBOX0) ? CAN_TSR_TXOK0 :
+                      (TxMailbox == CAN_TX_MAILBOX1) ? CAN_TSR_TXOK1 : CAN_TSR_TXOK2;
+  uint32_t rqcp_bit = (TxMailbox == CAN_TX_MAILBOX0) ? CAN_TSR_RQCP0 :
+                      (TxMailbox == CAN_TX_MAILBOX1) ? CAN_TSR_RQCP1 : CAN_TSR_RQCP2;
+
+  can_last_esr = hcan1.Instance->ESR;
+  can_last_tsr = hcan1.Instance->TSR;
+
+  // Writing RQCP clears this mailbox's flags, so can_last_tsr only ever shows the latest attempt
+  hcan1.Instance->TSR = rqcp_bit;
+
+  return (can_last_tsr & txok_bit) ? HAL_OK : HAL_ERROR;
+}
+
+
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
 
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_USART2_UART_Init();
   MX_CAN1_Init();
-  MX_I2C3_Init();
-
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
-  if (!can_common_init(&hcan1, MY_NODE_ID))
-  {
-    debug_print("CAN INIT FAILED\r\n");
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-    while (1) {}
-  }
-  can_set_motor_filter(MY_MOTOR_CAN_ID);
-  debug_printf("CAN OK node=%u motor=%u\r\n",
-               (unsigned)MY_NODE_ID, (unsigned)MY_MOTOR_CAN_ID);
+  node_id_blink();
+  imu_init();
 
-  lsm6ds3tr_init_driver(&hi2c3);
-  if (!lsm6ds3tr_check_connection())
-  {
-    debug_print("IMU NOT FOUND\r\n");
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-    while (1) {}
-  }
-  lsm6ds3tr_calibrate();
-  debug_print("READY\r\n");
+  if (!can_common_init(&hcan1, NODE_ID))
+    Error_Handler();
 
-  uint32_t last_imu_tick    = HAL_GetTick();
-  uint32_t last_status_tick = HAL_GetTick();
+  if (JOINT_MOTOR_ID && !can_set_motor_filter(JOINT_MOTOR_ID)) Error_Handler();
+
+  /* Start the stale-sample clock here: the gyro's turn-on time alone could
+     otherwise read as a stalled stream on the first pass */
+  last_sample_tick = HAL_GetTick();
+  last_blink_tick = last_sample_tick;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE BEGIN WHILE */
-
-    /* ── Drain CAN RX ──
-     * NO per-frame logging. At two nodes with VESC traffic, anything
-     * faster than 1 Hz over UART blocks the main loop and breaks the
-     * 50 ms motor refresh.
-     */
-    CanFrame rx_frame;
-    while (can_recv(&rx_frame))
-    {
-      if (rx_frame.is_extended)
-      {
-        ext_rx_count++;
-        motor_receive(&motor_status, rx_frame.data);
-
-        /* First time we hear from the VESC = motor is detected. Zero the
-         * encoder origin so position is reported relative to whatever pose
-         * the joint is in at startup. Mode 0 = temporary (lost on power
-         * cycle), so each boot re-zeros without writing to the VESC's flash. */
-        if (!origin_set)
-        {
-          comm_can_set_origin(MY_MOTOR_CAN_ID, 0);
-          origin_set = 1;
-        }
-
-        
-      }
-      else
-      {
-
-        if (rx_frame.id == CAN_ID_GLOBAL_RESET)
-        {
-          for (int i = 0; i < 10; i++)
-          {
-            HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-            HAL_Delay(50);
-          }
-          HAL_NVIC_SystemReset();
-        }
-        
-        uint8_t msg_type = can_get_msg_type((uint16_t)rx_frame.id);
-
-        if (msg_type == CAN_MSG_ESTOP)
-        {
-          active_current = 0.0f;
-          motor_active   = 0;
-          estop_active   = 1;
-          comm_can_set_current(MY_MOTOR_CAN_ID, 0.0f);
-        }
-        else if (msg_type == CAN_MSG_TORQUE_CMD && !estop_active)
-        {
-          float torque_nm;
-          if (can_parse_torque_cmd(&rx_frame, &torque_nm))
-          {
-            float current = torque_nm / KT_EFFECTIVE;
-            active_current = clampf(current, -CURRENT_LIMIT, CURRENT_LIMIT);
-            motor_active = 1;
-            comm_can_set_current(MY_MOTOR_CAN_ID, active_current);
-            last_refresh_tick = HAL_GetTick();
-          }
-        }
-      }
-    }
-
-    /* ── Refresh: re-send current command every 50 ms to prevent VESC timeout ── */
-    if (motor_active &&
-        (HAL_GetTick() - last_refresh_tick >= CURRENT_REFRESH_MS))
-    {
-      comm_can_set_current(MY_MOTOR_CAN_ID, active_current);
-      last_refresh_tick = HAL_GetTick();
-    }
-
-    /* ── 200 Hz IMU send + DMA read ── */
-    if ((HAL_GetTick() - last_imu_tick) >= IMU_PERIOD_MS)
-    {
-      last_imu_tick = HAL_GetTick();
-      CAN_Send_IMU_Data();
-      lsm6ds3tr_init_dma_read();
-    }
-
-    /* ── 1 Hz status dump (mirrors torque-controller) ── */
-    if (HAL_GetTick() - last_status_tick >= 1000)
-    {
-      debug_printf("[STATUS] active=%d estop=%d cmd=%.3fA motor_rx=%lu | "
-                   "pos=%.1f spd=%.0f cur=%.2fA temp=%dC err=%d\r\n",
-                   motor_active, estop_active, active_current,
-                   (unsigned long)ext_rx_count,
-                   motor_status.position, motor_status.speed,
-                   motor_status.current, motor_status.temperature,
-                   motor_status.error);
-      last_status_tick = HAL_GetTick();
-    }
-
     /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    /* Sleep until the next interrupt (INT1 or SysTick). PRIMASK closes the
+       window where INT1 could fire between the check and the WFI: a pending
+       IRQ still wakes WFI with PRIMASK set, and runs once it is cleared */
+    __disable_irq();
+    if (!imu_drdy)
+      __WFI();
+    __enable_irq();
+
+    motor_service();
+    if (!reset_pending) imu_stream();
   }
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+  /** Configure the main internal regulator output voltage
+  */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 180;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 2;
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -281,156 +554,63 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  /** Activate the Over-Drive mode
+  */
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
-}
-
-/**
- * @brief CAN1 Initialization Function
- */
-static void MX_CAN1_Init(void)
-{
-  hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 3;
-  hcan1.Init.Mode = CAN_MODE_NORMAL;
-  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_10TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_3TQ;
-  hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = ENABLE;
-  hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = ENABLE;
-  hcan1.Init.ReceiveFifoLocked = DISABLE;
-  hcan1.Init.TransmitFifoPriority = DISABLE;
-  if (HAL_CAN_Init(&hcan1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
- * @brief I2C3 Initialization Function
- */
-static void MX_I2C3_Init(void)
-{
-  hi2c3.Instance = I2C3;
-  hi2c3.Init.ClockSpeed = 400000;
-  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c3.Init.OwnAddress1 = 0;
-  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c3.Init.OwnAddress2 = 0;
-  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
- * @brief USART2 Initialization Function
- */
-static void MX_USART2_UART_Init(void)
-{
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
- * Enable DMA controller clock
- */
-static void MX_DMA_Init(void)
-{
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
-}
-
-/**
- * @brief GPIO Initialization Function
- */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 }
 
 /* USER CODE BEGIN 4 */
 
-/**
- * @brief Encode + transmit the latest IMU reading. Motor position rides
- *        along in the gyro frame's spare 2 bytes (DLC 8) for shared timestamp.
- */
-static void CAN_Send_IMU_Data(void)
-{
-  LSM6DS3TR_Data_t *imu = lsm6ds3tr_get_data();
-
-  if (imu->state != SENSOR_STATE_CONNECTED) return;
-  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) < 2) return;
-
-  HAL_NVIC_DisableIRQ(DMA1_Stream1_IRQn);
-  float ax = imu->accel.filt_x;
-  float ay = imu->accel.filt_y;
-  float az = imu->accel.filt_z;
-  float gx = imu->gyro.filt_x;
-  float gy = imu->gyro.filt_y;
-  float gz = imu->gyro.filt_z;
-  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
-
-  can_send_imu_accel(MY_NODE_ID, ax, ay, az);
-  can_send_imu_gyro(MY_NODE_ID, gx, gy, gz, motor_status.position);
-}
-
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1) {}
+  while (1)
+  {
+    // Fast blink so startup errors are distinguishable from a solid "not sending" LED.
+    // Busy-wait because interrupts are off, so HAL_Delay() would hang.
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    for (volatile uint32_t i = 0; i < ERROR_BLINK_LOOPS; i++);
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
