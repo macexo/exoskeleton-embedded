@@ -288,10 +288,6 @@ def process_msg(msg: can.Message):
     if src_node == can_common.NODE_PI:
         return
 
-    if src_node in NODES:
-        with status_lock:
-            last_seen[src_node] = time.monotonic()
-
     if msg_type == can_common.MSG_ESTOP:
         try:
             reason = can_system.parse_estop(msg)
@@ -337,6 +333,7 @@ def process_msg(msg: can.Message):
             position, speed, current, temperature, error = can_motor.parse_motor_status(msg)
             with state_lock:
                 joint["motor"] = {
+                    "received_at": time.monotonic(),
                     "position":    position,         # degrees
                     "speed":       speed,
                     "current":     current,
@@ -371,6 +368,13 @@ def process_msg(msg: can.Message):
         else:
             pos_deg = joint["temp_motor_pos"]
             if pos_deg is None and joint["motor"] is not None:
+                # SPI uses the 20 Hz motor-status stream for encoder input.
+                # Drop the sample if four reporting intervals have elapsed.
+                if (joint["spi_sequence"] is not None and
+                        time.monotonic() - joint["motor"]["received_at"] >= 0.2):
+                    joint["temp_accel"] = None
+                    joint["temp_gyro"] = None
+                    return
                 pos_deg = joint["motor"]["position"]
             if pos_deg is None and ALLOW_ENCODER_FALLBACK_ZERO:
                 pos_deg = 0.0
@@ -396,6 +400,9 @@ def process_msg(msg: can.Message):
                     dt_ms = (t_s - joint["last_pair_t_s"]) * 1000.0
                     joint["intervals_ms"].append(dt_ms)
                 joint["last_pair_t_s"] = t_s
+            # Status-only traffic cannot keep a stalled IMU online.
+            with status_lock:
+                last_seen[src_node] = time.monotonic()
         joint["temp_accel"] = None
         joint["temp_gyro"] = None
         joint["temp_motor_pos"] = None
