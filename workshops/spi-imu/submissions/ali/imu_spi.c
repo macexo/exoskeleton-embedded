@@ -1,4 +1,4 @@
-#include "../../firmware/Core/Inc/imu_spi.h"
+#include "imu_spi.h"
 #include <stdint.h>
 
 static int valid_device(const imu_device_t *imu)
