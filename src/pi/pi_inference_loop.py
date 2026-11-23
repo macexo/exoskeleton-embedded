@@ -226,6 +226,7 @@ def make_joint_state():
         # completed the pair. assemble_window() linearly interpolates onto a
         # fixed 10 ms grid from this buffer.
         "samples":         deque(maxlen=RAW_BUFFER_LEN),
+        "spi_sequence":    None,   # pending SPI accel sequence, per joint
         "temp_accel":      None,
         "temp_gyro":       None,
         "temp_motor_pos":  None,   # deg, parsed from the gyro frame
@@ -277,7 +278,7 @@ loop_stats = {
 # ─────────────────────────── CAN listener ───────────────────────────
 
 def process_msg(msg: can.Message):
-    if msg.is_extended_id:
+    if msg.is_extended_id or msg.is_remote_frame or msg.is_error_frame:
         return
     msg_type, src_node, dest = can_common.parse_can_id(msg.arbitration_id)
 
@@ -306,16 +307,32 @@ def process_msg(msg: can.Message):
 
     try:
         if msg_type == can_common.MSG_IMU_ACCEL:
-            joint["temp_accel"] = can_imu.parse_imu_accel(msg)
+            joint["temp_accel"] = None
+            joint["spi_sequence"] = None
+            if len(msg.data) == 8:
+                sequence, *axes = struct.unpack("<Hhhh", msg.data)
+                joint["spi_sequence"] = sequence
+                joint["temp_accel"] = tuple(raw * 0.000488 * 9.80665 for raw in axes)
+            elif len(msg.data) == 6:
+                joint["temp_accel"] = can_imu.parse_imu_accel(msg)
+            return
         elif msg_type == can_common.MSG_IMU_GYRO:
-            # The gyro frame now carries motor position alongside gyro xyz.
-            gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
-            joint["temp_gyro"] = (
-                gx * DEG_TO_RAD,
-                gy * DEG_TO_RAD,
-                gz * DEG_TO_RAD,
-            )
-            joint["temp_motor_pos"] = motor_pos   # deg, may be None
+            if joint["temp_accel"] is None:
+                return
+            if joint["spi_sequence"] is not None:
+                if len(msg.data) != 8:
+                    return
+                sequence, *axes = struct.unpack("<Hhhh", msg.data)
+                if sequence != joint["spi_sequence"]:
+                    return
+                joint["temp_gyro"] = tuple(math.radians(raw * 0.070) for raw in axes)
+                joint["temp_motor_pos"] = None  # supplied by MOTOR_STATUS
+            else:
+                if len(msg.data) not in (6, 8):
+                    return
+                gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
+                joint["temp_gyro"] = tuple(math.radians(axis) for axis in (gx, gy, gz))
+                joint["temp_motor_pos"] = motor_pos
         elif msg_type == can_common.MSG_MOTOR_STATUS:
             position, speed, current, temperature, error = can_motor.parse_motor_status(msg)
             with state_lock:
