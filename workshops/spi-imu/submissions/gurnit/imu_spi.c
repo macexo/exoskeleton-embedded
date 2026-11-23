@@ -46,7 +46,6 @@ imu_status_t imu_check_identity(const imu_device_t *imu)
     return IMU_OK;
 }
 
-// Next: adapt the worked read to send a register address and its new value
 imu_status_t imu_write_register(const imu_device_t *imu, uint8_t reg, uint8_t value)
 {
     if (!valid_device(imu) || reg > 0x7fu) {
