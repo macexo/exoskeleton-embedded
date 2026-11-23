@@ -15,6 +15,8 @@ HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_RESET); -- HAL_GPIO_WriteP
 
 CS stays active LO because in standard SPI protocol bus communication is only active on LO and sleep on HI. Staying LO ensures transfer is treated as one clean operation instead of two distinct processes.
 
+rx[0] is a dummy byte that exists to facilitate the STM32's 8 clocks for the IMU.
+rx[1] is the final destination of the shift register.
 ## Workshop results
 
 **Not built or tested on hardware yet.** Replace this with actual results after testing.
