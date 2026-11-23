@@ -1,4 +1,4 @@
-import struct
+import argparse
 import sys
 import threading
 from collections import deque
@@ -9,19 +9,20 @@ import can
 
 try:
     import can_common
-    import can_imu
+    import can_v3
 except ImportError:
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from apis.can.python import can_common, can_imu
+    from apis.can.python import can_common, can_v3
 
-# STM32 streams accel+gyro pairs at 500 Hz. The ML model wants 187 Hz, so we
+# V3 streams sequence-paired raw accel+gyro at 417 Hz. Keep a 187 Hz view, so we
 # downsample with a Bresenham-style accumulator below: every paired sample adds
 # `target` to an accumulator and emits one entry whenever it crosses `hz`. This
 # spreads the kept samples uniformly without timer jitter.
-hz = 500
+hz = can_v3.SAMPLE_RATE_HZ
 target = 187
+imu_receiver = can_v3.ImuReceiver()
 
 NODE_TO_IMU = {
     can_common.NODE_LEFT_HIP: "imu1",
@@ -41,62 +42,28 @@ def make_imu_state():
     return {
         "accumulator": 0,
         "queue": deque(maxlen=target),
-        "temp_accel": None,
-        "temp_gyro": None,
-        "timestamp": 0.0,
     }
 
 
 imus = {imu_key: make_imu_state() for imu_key in IMU_LABELS}
 queue_lock = threading.Lock()
 
-print("buffering joint data...")
-
 
 def process_msg(msg: can.Message):
-    if msg.is_extended_id:
+    """Buffer only complete V3 sequence pairs, in m/s² and degrees/s."""
+    pair = imu_receiver.process(msg)
+    if pair is None:
         return
-
-    msg_type, src_node, dest = can_common.parse_can_id(msg.arbitration_id)
-    if dest != can_common.NODE_PI:
-        return
-
-    imu_key = NODE_TO_IMU.get(src_node)
-    if imu_key is None:
-        return
-
-    stream_state = imus[imu_key]
-
-    try:
-        if msg_type == can_common.MSG_IMU_ACCEL:
-            stream_state["temp_accel"] = can_imu.parse_imu_accel(msg)
-            stream_state["timestamp"] = msg.timestamp * 1000.0
-        elif msg_type == can_common.MSG_IMU_GYRO:
-            stream_state["temp_gyro"] = can_imu.parse_imu_gyro(msg)
-        else:
-            return
-    except struct.error as e:
-        print(f"cannot unpack IMU frame 0x{msg.arbitration_id:03X}: {e}")
-        return
-
-    # Keep accel and gyro paired before adding a sample to the public queue.
-    if stream_state["temp_accel"] is not None and stream_state["temp_gyro"] is not None:
+    stream_state = imus[NODE_TO_IMU[pair.node]]
+    with queue_lock:
+        if pair.discontinuity:
+            stream_state["queue"].clear()
+            stream_state["accumulator"] = 0
         stream_state["accumulator"] += target
-
         if stream_state["accumulator"] >= hz:
-            data_tuple = (
-                stream_state["timestamp"],
-                stream_state["temp_accel"],
-                stream_state["temp_gyro"],
-            )
-
-            with queue_lock:
-                stream_state["queue"].append(data_tuple)
-
+            stream_state["queue"].append(
+                (pair.timestamp * 1000.0, pair.accel_mps2, pair.gyro_dps))
             stream_state["accumulator"] -= hz
-
-        stream_state["temp_accel"] = None
-        stream_state["temp_gyro"] = None
 
 
 def can_listener(channel="can1"):
@@ -132,8 +99,8 @@ def print_full_queue(imu_key):
         timestamp, accel, gyro = data_point
         print(
             f"[{i + 1:3}] Time: {timestamp:.4f} | "
-            f"Accel: {accel[0]:6.2f}, {accel[1]:6.2f}, {accel[2]:6.2f} | "
-            f"Gyro: {gyro[0]:6.2f}, {gyro[1]:6.2f}, {gyro[2]:6.2f}"
+            f"Accel (m/s²): {accel[0]:6.2f}, {accel[1]:6.2f}, {accel[2]:6.2f} | "
+            f"Gyro (deg/s): {gyro[0]:6.2f}, {gyro[1]:6.2f}, {gyro[2]:6.2f}"
         )
 
     print()
@@ -151,8 +118,8 @@ def print_latest(imu_key):
     print(f"\n [{imu_key} / {IMU_LABELS[imu_key]}] snapshot taken")
     print(f"total samples in queue: {len(data)}")
     print(f"UNIX time (ms): {latest_time}")
-    print(f"accel (x,y,z): {latest_accel}")
-    print(f"gyro (x,y,z): {latest_gyro}")
+    print(f"accel m/s² (x,y,z): {latest_accel}")
+    print(f"gyro deg/s (x,y,z): {latest_gyro}")
     print()
 
 
@@ -167,9 +134,12 @@ def print_help():
 
 
 def main():
-    print("exo telemetry, i choose you")
+    parser = argparse.ArgumentParser(description="V3 SPI IMU CAN buffer (417 Hz input)")
+    parser.add_argument("channel", nargs="?", default="can1")
+    args = parser.parse_args()
+    print("buffering V3 sequence-paired IMU data (m/s², deg/s)")
 
-    can_thread = threading.Thread(target=can_listener, daemon=True)
+    can_thread = threading.Thread(target=can_listener, args=(args.channel,), daemon=True)
     can_thread.start()
 
     print("initially filling queues")

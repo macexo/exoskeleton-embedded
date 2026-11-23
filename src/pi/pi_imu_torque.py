@@ -4,10 +4,10 @@ pi_imu_torque.py
 Combined IMU buffering and torque commanding for the McMaster Exoskeleton Pi.
 
 A background listener thread fans out CAN frames by message type:
-  - IMU_ACCEL / IMU_GYRO: paired per joint, downsampled 500 Hz -> 187 Hz with
+  - IMU_ACCEL / IMU_GYRO: paired per joint, downsampled 417 Hz -> 187 Hz with
     a Bresenham accumulator, and pushed into a per-joint deque
     (matches pi_can_buffer.py).
-  - MOTOR_STATUS: stored as the latest snapshot per joint.
+  - Direct extended motor feedback: stored independently per joint.
   - ESTOP: logged to the console.
 The foreground loop is an interactive prompt that sends torque commands and
 queries the buffered IMU / motor state. It mirrors torque_cmd.py for the
@@ -28,7 +28,8 @@ Usage:
     python3 pi_imu_torque.py [can_interface]   # default can_interface = can1
 """
 
-import struct
+import argparse
+import math
 import sys
 import threading
 import time
@@ -40,21 +41,24 @@ import can
 
 try:
     import can_common
-    import can_imu
+    import can_v3
     import can_motor
     import can_system
 except ImportError:
     REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from apis.can.python import can_common, can_imu, can_motor, can_system
+    from apis.can.python import can_common, can_v3, can_motor, can_system
 
-# STM32 streams accel+gyro pairs at 500 Hz. The ML model wants 187 Hz, so we
+# V3 streams sequence-paired raw accel+gyro at 417 Hz. The ML model wants 187 Hz, so we
 # downsample with a Bresenham-style accumulator below: every paired sample adds
 # `target` to an accumulator and emits one entry whenever it crosses `hz`. This
 # spreads the kept samples uniformly without timer jitter.
-hz = 500
+hz = can_v3.SAMPLE_RATE_HZ
 target = 187
+imu_receiver = can_v3.ImuReceiver()
+motor_map = dict(can_v3.DEFAULT_MOTOR_MAP)
+feedback_source = "forwarded"
 
 # AK70-9 KV60 effective torque constant (Kt * gear_ratio). Used only to display
 # the implied current to the operator; the STM32 does the real conversion.
@@ -78,10 +82,6 @@ def make_joint_state():
         # IMU pairing + downsampling state
         "accumulator": 0,
         "queue": deque(maxlen=target),
-        "temp_accel": None,
-        "temp_gyro": None,
-        "temp_motor_pos": None,   # latest motor position from the gyro frame
-        "timestamp": 0.0,
         # Latest full motor status snapshot (or None until a frame arrives)
         "motor": None,
     }
@@ -98,20 +98,9 @@ STALE_THRESHOLD_S    = 1.0   # silent for >1s -> stale
 WATCHDOG_INTERVAL_S  = 0.5
 
 last_seen           = {nid: None for nid in NODES}
-seen_msg_types      = {nid: set() for nid in NODES}
 prev_motor_error_pi = {nid: 0 for nid in NODES}
 stale_state         = {nid: False for nid in NODES}
 status_lock         = threading.Lock()
-
-MSG_TYPE_NAMES = {
-    can_common.MSG_ESTOP:        "ESTOP",
-    can_common.MSG_TORQUE_CMD:   "TORQUE_CMD",
-    can_common.MSG_MOTOR_STATUS: "MOTOR_STATUS",
-    can_common.MSG_IMU_ACCEL:    "IMU_ACCEL",
-    can_common.MSG_IMU_GYRO:     "IMU_GYRO",
-    can_common.MSG_HEARTBEAT:    "HEARTBEAT",
-}
-
 
 def stale_watchdog():
     """Edge-log when a known joint goes silent for >STALE_THRESHOLD_S, and
@@ -134,86 +123,46 @@ def stale_watchdog():
 
 
 def process_msg(msg: can.Message):
-    if msg.is_extended_id:
-        return  # VESC feedback frames stay between STM32 and the motor
-
-    msg_type, src_node, dest = can_common.parse_can_id(msg.arbitration_id)
-
-    # Mark the source as alive and log the first frame of each (node, type).
-    if src_node in NODES:
+    """Receive V3 sequence-paired IMUs and independent motor feedback."""
+    feedback = can_v3.decode_motor_feedback(msg, motor_map, feedback_source)
+    if feedback is not None:
+        node, motor = feedback
+        with state_lock:
+            joints[node]["motor"] = motor
         with status_lock:
-            last_seen[src_node] = time.monotonic()
-            if msg_type not in seen_msg_types[src_node]:
-                seen_msg_types[src_node].add(msg_type)
-                name = MSG_TYPE_NAMES.get(msg_type, f"0x{msg_type:X}")
-                print(f"\n[NODE] first {name} from {NODES[src_node]}")
-
-    if msg_type == can_common.MSG_ESTOP:
-        try:
-            reason = can_system.parse_estop(msg)
-        except struct.error:
-            reason = -1
-        print(f"\n[ESTOP] from node {src_node} (reason {reason})")
+            if motor["error"] != prev_motor_error_pi[node]:
+                print(f"\n[MOTOR] {NODES[node]} fault "
+                      f"{prev_motor_error_pi[node]} -> {motor['error']}")
+                prev_motor_error_pi[node] = motor["error"]
         return
-
-    if dest != can_common.NODE_PI:
+    if (not msg.is_extended_id and msg.arbitration_id == 0 and msg.dlc == 1
+            and len(msg.data) == 1 and not msg.is_remote_frame
+            and not msg.is_error_frame and not msg.is_fd):
+        print(f"\n[ESTOP] reason {msg.data[0]}")
         return
-
-    if src_node not in joints:
+    pair = imu_receiver.process(msg)
+    if pair is None:
         return
-
-    joint = joints[src_node]
-
-    try:
-        if msg_type == can_common.MSG_IMU_ACCEL:
-            joint["temp_accel"] = can_imu.parse_imu_accel(msg)
-            joint["timestamp"] = msg.timestamp * 1000.0
-        elif msg_type == can_common.MSG_IMU_GYRO:
-            gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
-            joint["temp_gyro"] = (gx, gy, gz)
-            joint["temp_motor_pos"] = motor_pos
-        elif msg_type == can_common.MSG_MOTOR_STATUS:
-            position, speed, current, temperature, error = can_motor.parse_motor_status(msg)
-            with state_lock:
-                joint["motor"] = {
-                    "timestamp": msg.timestamp * 1000.0,
-                    "position": position,
-                    "speed": speed,
-                    "current": current,
-                    "temperature": temperature,
-                    "error": error,
-                }
-            with status_lock:
-                if error != prev_motor_error_pi[src_node]:
-                    print(f"\n[MOTOR] {NODES[src_node]} error "
-                          f"{prev_motor_error_pi[src_node]} -> {error}")
-                    prev_motor_error_pi[src_node] = error
-            return
-        else:
-            return
-    except struct.error as e:
-        print(f"\n[CAN] cannot unpack frame 0x{msg.arbitration_id:03X}: {e}")
-        return
-
-    # Pair accel + gyro (which carries motor_position) before pushing to the
-    # public queue. Tuple order: (time_ms, gyro_xyz, accel_xyz, motor_position).
-    if joint["temp_accel"] is not None and joint["temp_gyro"] is not None:
+    node = pair.node
+    with state_lock:
+        joint = joints[node]
+        if pair.discontinuity:
+            joint["queue"].clear()
+            joint["accumulator"] = 0
         joint["accumulator"] += target
-
         if joint["accumulator"] >= hz:
-            data_tuple = (
-                joint["timestamp"],
-                joint["temp_gyro"],
-                joint["temp_accel"],
-                joint["temp_motor_pos"],
-            )
-            with state_lock:
-                joint["queue"].append(data_tuple)
+            motor = joint["motor"]
+            position = motor["position"] if can_v3.fresh_motor(motor) else None
+            # Public tuple shape retained; acceleration m/s², gyro degrees/s.
+            joint["queue"].append((pair.timestamp * 1000.0, pair.gyro_dps,
+                                   pair.accel_mps2, position))
             joint["accumulator"] -= hz
-
-        joint["temp_accel"] = None
-        joint["temp_gyro"] = None
-        joint["temp_motor_pos"] = None
+    with status_lock:
+        first = last_seen[node] is None
+        last_seen[node] = time.monotonic()
+        stale_state[node] = False
+    if first:
+        print(f"\n[NODE] first complete V3 IMU pair from {NODES[node]}")
 
 
 def can_listener(bus: can.Bus):
@@ -248,15 +197,26 @@ def get_motor_status(node_id: int):
         return None
     with state_lock:
         snap = joints[node_id]["motor"]
-        return dict(snap) if snap is not None else None
+        if snap is None:
+            return None
+        result = dict(snap)
+    result["age_s"] = max(0.0, time.monotonic() - result["received_at"],
+                          (time.time() * 1000.0 - result["timestamp"]) / 1000.0)
+    result["stale"] = not can_v3.fresh_motor(result)
+    return result
 
 
 def send_torque(bus: can.Bus, node_id: int, torque_nm: float):
-    """Public sender: forward a torque command to a joint."""
+    """Forward a validated request; return whether the local send succeeded."""
+    if (type(node_id) is not int or node_id not in NODES
+            or not math.isfinite(torque_nm) or abs(torque_nm) > TORQUE_LIMIT):
+        raise ValueError(f"joint must be 1..4 and torque finite within +/-{TORQUE_LIMIT:.3f} Nm")
     try:
         can_motor.send_torque_cmd(bus, node_id, torque_nm)
     except can.CanError as e:
         print(f"[CAN] send_torque to {NODES.get(node_id, node_id)} failed: {e}")
+        return False
+    return True
 
 
 def _fmt_pos(pos):
@@ -274,8 +234,8 @@ def print_full_queue(node_id: int):
     for i, (timestamp, gyro, accel, motor_pos) in enumerate(data, start=1):
         print(
             f"[{i:3}] Time: {timestamp:.4f} | "
-            f"Gyro: {gyro[0]:6.2f}, {gyro[1]:6.2f}, {gyro[2]:6.2f} | "
-            f"Accel: {accel[0]:6.2f}, {accel[1]:6.2f}, {accel[2]:6.2f} | "
+            f"Gyro deg/s: {gyro[0]:6.2f}, {gyro[1]:6.2f}, {gyro[2]:6.2f} | "
+            f"Accel m/s²: {accel[0]:6.2f}, {accel[1]:6.2f}, {accel[2]:6.2f} | "
             f"Pos: {_fmt_pos(motor_pos)} deg"
         )
     print()
@@ -291,8 +251,8 @@ def print_latest_imu(node_id: int):
     timestamp, gyro, accel, motor_pos = data[-1]
     print(f"\n[{label}] latest IMU sample (queue depth {len(data)})")
     print(f"  time (ms):     {timestamp:.4f}")
-    print(f"  gyro:          {gyro}")
-    print(f"  accel:         {accel}")
+    print(f"  gyro deg/s:    {gyro}")
+    print(f"  accel m/s²:    {accel}")
     print(f"  motor pos deg: {_fmt_pos(motor_pos)}")
     print()
 
@@ -304,11 +264,12 @@ def print_motor_status(node_id: int):
         print(f"[{label}] no motor status received yet")
         return
 
-    print(f"\n[{label}] motor status")
+    print(f"\n[{label}] last motor feedback "
+          f"({'STALE' if snap['stale'] else 'fresh'}, age {snap['age_s']:.3f} s)")
     print(f"  time (ms):   {snap['timestamp']:.4f}")
     print(f"  position:    {snap['position']:.2f} deg")
     print(f"  speed:       {snap['speed']:.0f} ERPM")
-    print(f"  current:     {snap['current']:.2f} A")
+    print(f"  phase current: {snap['phase_current']:.2f} A")
     print(f"  temperature: {snap['temperature']} C")
     print(f"  error:       {snap['error']}")
     print()
@@ -323,7 +284,7 @@ def print_help():
     for nid, label in NODES.items():
         print(f"  m{nid}              latest motor status for {label}")
     print("  t <node> <Nm>   send torque to a joint (node = 1..4)")
-    print("  tall <Nm>       send the same torque to all joints")
+    print("  t_all <Nm>      request the same torque on all joints (alias: tall)")
     print("  tstop           zero torque on all joints")
     print("  estop           broadcast ESTOP (latches each STM32)")
     print("  h               show this help")
@@ -364,12 +325,12 @@ def handle_command(bus: can.Bus, raw: str) -> bool:
 
     if cmd == "tstop":
         for nid, label in NODES.items():
-            send_torque(bus, nid, 0.0)
-            print(f"  {label}: 0.000 Nm")
-        print("all joints zeroed")
+            if send_torque(bus, nid, 0.0):
+                print(f"  {label}: sent zero torque request")
+        print("zero torque requests attempted on all joints")
         return True
 
-    if cmd == "tall":
+    if cmd in ("t_all", "tall"):
         if len(parts) != 2:
             print("usage: tall <torque_nm>")
             return True
@@ -378,9 +339,12 @@ def handle_command(bus: can.Bus, raw: str) -> bool:
         except ValueError:
             print("torque must be a number")
             return True
+        if not math.isfinite(torque) or abs(torque) > TORQUE_LIMIT:
+            print(f"torque must be finite within +/-{TORQUE_LIMIT:.3f} Nm")
+            return True
         for nid, label in NODES.items():
-            send_torque(bus, nid, torque)
-            print(f"  {label}: {torque:.3f} Nm")
+            if send_torque(bus, nid, torque):
+                print(f"  {label}: sent request {torque:.3f} Nm (execution unconfirmed)")
         return True
 
     if cmd == "t":
@@ -396,9 +360,13 @@ def handle_command(bus: can.Bus, raw: str) -> bool:
         if node_id not in NODES:
             print(f"unknown node {node_id}. valid: {list(NODES.keys())}")
             return True
-        send_torque(bus, node_id, torque)
-        iq = torque / KT_EFFECTIVE
-        print(f"sent {torque:.3f} Nm to {NODES[node_id]} (STM32 will command ~{iq:.3f} A)")
+        if not math.isfinite(torque) or abs(torque) > TORQUE_LIMIT:
+            print(f"torque must be finite within +/-{TORQUE_LIMIT:.3f} Nm")
+            return True
+        if send_torque(bus, node_id, torque):
+            iq = torque / KT_EFFECTIVE
+            print(f"sent request {torque:.3f} Nm to {NODES[node_id]} "
+                  f"(nominal {iq:.3f} A; execution unconfirmed)")
         return True
 
     kind, node_id = parse_query_command(cmd)
@@ -417,9 +385,21 @@ def handle_command(bus: can.Bus, raw: str) -> bool:
 
 
 def main():
-    channel = sys.argv[1] if len(sys.argv) > 1 else "can1"
+    global motor_map, feedback_source
+    parser = argparse.ArgumentParser(description="V3 IMU and torque commissioning console")
+    parser.add_argument("channel", nargs="?", default="can1")
+    parser.add_argument("--feedback-source", choices=can_v3.FEEDBACK_SOURCES,
+                        default="forwarded", help="forwarded PR4 status (default) or raw direct0x29")
+    parser.add_argument("--motor-map", type=can_v3.parse_motor_map,
+                        default=dict(can_v3.DEFAULT_MOTOR_MAP))
+    args = parser.parse_args()
+    channel = args.channel
+    motor_map = args.motor_map
+    feedback_source = args.feedback_source
 
-    print("Exoskeleton IMU + Torque Console")
+    print("Exoskeleton V3 SPI IMU + Torque Console")
+    print(f"Motor feedback source: {feedback_source}; configured driver map: {motor_map}")
+    print("PR4 defaults: only node4->107; other nodes need JOINT_MOTOR_ID assignment")
     print("=" * 50)
     print(f"CAN interface: {channel}")
     print("bitrate:       1 Mbit/s (must be configured at the OS level)")
