@@ -36,6 +36,11 @@ class JointInferenceTest(unittest.TestCase):
         self.assertFalse(loop.joints[2]["samples"])
         self.assertIsNone(loop.last_seen[2])
 
+    def test_spi_waits_for_first_motor_status(self):
+        for kind in (3, 4):
+            self.receive(kind, 4, struct.pack("<Hhhh", 17, 1, 2, 3))
+        self.assertFalse(loop.joints[4]["samples"])
+
     def test_stale_motor_status_drops_spi_sample(self):
         with patch.object(loop.time, "monotonic", return_value=1.0):
             self.receive(2, 4, struct.pack("<hhh bB", 300, 2, 0, 40, 0))

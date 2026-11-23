@@ -376,7 +376,7 @@ def process_msg(msg: can.Message):
                     joint["temp_gyro"] = None
                     return
                 pos_deg = joint["motor"]["position"]
-            if pos_deg is None and ALLOW_ENCODER_FALLBACK_ZERO:
+            if pos_deg is None and joint["spi_sequence"] is None and ALLOW_ENCODER_FALLBACK_ZERO:
                 pos_deg = 0.0
                 if not encoder_fallback_logged[src_node]:
                     print(f"\n[ENCODER] {NODES[src_node]} has no motor "
