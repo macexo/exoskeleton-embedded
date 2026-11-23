@@ -13,7 +13,7 @@ write register: Bitwise AND every value of reg with 01111111 (0x7F), to CLEAR ms
 
 HAL_GPIO_WritePin(imu->cs_port, imu->cs_pin, GPIO_PIN_RESET); -- HAL_GPIO_WritePin sends GPIO_PIN_RESET to imu IO, this sets CS to low (like an SR latch). 
 
-CS stays active LO because in standard 
+CS stays active LO because in standard SPI protocol bus communication is only active on LO and sleep on HI. Staying LO ensures transfer is treated as one clean operation instead of two distinct processes.
 
 ## Workshop results
 
