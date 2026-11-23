@@ -17,7 +17,7 @@ loop for 1 Mbit/s and check its physical CANH/CANL transceiver connection.
 | CAN traffic | Encoding |
 | --- | --- |
 | IMU to Pi | Standard IDs `0x180 + (node << 4)` and `0x200 + (node << 4)`. Both carry a little-endian uint16 sequence and three signed int16 raw axes. |
-| Motor status to Pi | Standard ID `0x100 + (node << 4)`. Position (0.1°), speed (10 ERPM), current (0.01 A), temperature (°C), and fault code. Fresh feedback is forwarded at up to 20 Hz, with fault changes eligible immediately. |
+| Motor status to Pi | Standard ID `0x100 + (node << 4)`. Position (0.1°), speed (10 ERPM), current (0.01 A), temperature (°C), and fault code. V3 servo feedback uses extended ID `(0x29 << 8) | motor_id` (motor 107: `0x296B`). Fresh feedback is forwarded at up to 20 Hz, with fault changes eligible immediately. |
 | Pi torque to joint | Standard ID `0x080 + node`, two little-endian bytes of signed millinewton-metres. The STM32 clamps current to ±5 A and requests zero after 200 ms without a fresh command. |
 
 ## Model-driven torque

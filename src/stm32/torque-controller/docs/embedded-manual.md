@@ -696,7 +696,7 @@ destination `0x1` (Left Hip).
 | SET_DUTY     | 0    | 0x00000068         | 4   | `int32 duty×100000`                |
 | SET_CURRENT  | 1    | 0x00000168         | 4   | `int32 I×1000` (A)                 |
 | SET_RPM      | 3    | 0x00000368         | 4   | `int32 erpm`                       |
-| Feedback     | 9    | 0x00000968 (rx)    | 8   | `int16 pos×10`, `int16 spd/10`, `int16 I×100`, `int8 T`, `uint8 err` |
+| Feedback (V3 servo) | 0x29 | 0x00002968 (rx)    | 8   | `int16 pos×10`, `int16 spd/10`, `int16 I×100`, `int8 T`, `uint8 err` |
 
 ### 11.2 Pinout Diagrams
 
