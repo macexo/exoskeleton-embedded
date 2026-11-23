@@ -22,28 +22,34 @@ exoskeleton-embedded/
 │   ├── stm32/                   # STM32 application projects
 │   └── pi/                      # Raspberry Pi application code
 ├── testing/
-│   ├── stm32/                   # Standalone STM32 hardware experiments
-│   │   ├── sensor-testing/      # LSM6DS3TR-C IMU testing over I2C
-│   │   │   ├── docs/
-│   │   │   │   ├── lsm6ds3tr-api.md
-│   │   │   │   └── testing-instructions.md
-│   │   │   ├── scripts/
-│   │   │   │   └── imu_uart_test.py
-│   │   │   └── Core/            # STM32CubeIDE firmware source
-│   │   └── motor-api-tests/     # AK70-9 motor testing over CAN
-│   │       ├── docs/
-│   │       │   ├── ak70-9-api.md
-│   │       │   └── testing-instructions.md
-│   │       ├── scripts/
-│   │       │   └── motor_test.py
-│   │       └── Core/            # STM32CubeIDE firmware source
-│   ├── discovery/               # Discovery-board experiments
+│   ├── stm32/
+│   │   ├── nucleo-f446re/        # NUCLEO-F446RE bench projects
+│   │   │   ├── can-api/
+│   │   │   ├── can-blink/
+│   │   │   ├── imu-uart/
+│   │   │   ├── motor-api-tests/
+│   │   │   ├── nucleo-pi-can/
+│   │   │   ├── sensor-testing/
+│   │   │   ├── torque-controller/
+│   │   │   └── uart-serial-com/
+│   │   ├── discovery-f429/       # STM32F429I-DISC1 bench projects
+│   │   │   ├── imu-test/
+│   │   │   └── torque-control-disc/
+│   │   └── joint-pcb-v2/         # V2 custom STM32F446RE joint PCB
+│   │       └── can-test/
 │   └── pi/                      # Raspberry Pi experiments
-├── workshops/                   # Assignments, starters, and member submissions
-├── CONTRIBUTING.md              # Contribution guidelines
-├── NOVEMBER_WORKSHOP.md         # November SPI workshop member guide
+├── workshops/                   # Learning exercises and member submissions
+│   └── spi-imu/
+├── CONTRIBUTING.md
+├── NOVEMBER_WORKSHOP.md
 └── README.md
 ```
+
+Group standalone tests by hardware target, then by test purpose. Use a PCB revision in the path when it identifies distinct hardware; keep software versions and competition-season snapshots in Git history/tags and documentation. Import the individual folder containing `.project` and `.ioc`, not an entire board group. Project names are retained, so projects sharing a CubeIDE name (such as `can-api` and `can-blink`, both named `exo-can`) need separate workspaces.
+
+The [final 2025–26 / ACE2026 snapshot](https://github.com/macexo/exoskeleton-embedded/commit/7ee332ff0386be1071b6d9ce570493b73baf9912) records the previous season's code. That provenance does not prevent its motor API, torque console, and joint-controller implementation from serving as references this season.
+
+The confirmed 2026–27 **V3 IMU/CAN baseline** lives in [sensing-actuation's `testing/stm32/pcb-imu-canbus`](https://github.com/macexo/exoskeleton-sensing-actuation/tree/main/testing/stm32/pcb-imu-canbus). Motor-control integration is being developed separately. The SPI workshop remains learning material under `workshops/`.
 
 ## Hardware Test Projects
 
@@ -53,10 +59,10 @@ Tests the **LSM6DS3TR-C** 6-axis IMU (accelerometer + gyroscope) over I2C. The N
 
 **Quick start:**
 
-1. Follow the project instructions to import `testing/stm32/sensor-testing` into STM32CubeIDE, build, and flash the firmware.
+1. Follow the project instructions to import `testing/stm32/nucleo-f446re/sensor-testing` into STM32CubeIDE, build, and flash the firmware.
 2. Run `python scripts/imu_uart_test.py` to send commands and read sensor data.
-3. See [`docs/testing-instructions.md`](testing/stm32/sensor-testing/docs/testing-instructions.md) for full setup and wiring details.
-4. See [`docs/lsm6ds3tr-api.md`](testing/stm32/sensor-testing/docs/lsm6ds3tr-api.md) for the driver API reference.
+3. See [`docs/testing-instructions.md`](testing/stm32/nucleo-f446re/sensor-testing/docs/testing-instructions.md) for full setup and wiring details.
+4. See [`docs/lsm6ds3tr-api.md`](testing/stm32/nucleo-f446re/sensor-testing/docs/lsm6ds3tr-api.md) for the driver API reference.
 
 ### motor-api-tests -- Motor Testing
 
@@ -64,10 +70,10 @@ Tests the **CubeMars AK70-9** brushless motor over CAN bus. The Nucleo board sen
 
 **Quick start:**
 
-1. Follow the project instructions to import `testing/stm32/motor-api-tests` into STM32CubeIDE, build, and flash the firmware.
+1. Follow the project instructions to import `testing/stm32/nucleo-f446re/motor-api-tests` into STM32CubeIDE, build, and flash the firmware.
 2. Run `python scripts/motor_test.py` to send commands and read motor telemetry.
-3. See [`docs/testing-instructions.md`](testing/stm32/motor-api-tests/docs/testing-instructions.md) for full setup, wiring, and CAN transceiver details.
-4. See [`docs/ak70-9-api.md`](testing/stm32/motor-api-tests/docs/ak70-9-api.md) for the motor CAN API reference.
+3. See [`docs/testing-instructions.md`](testing/stm32/nucleo-f446re/motor-api-tests/docs/testing-instructions.md) for full setup, wiring, and CAN transceiver details.
+4. See [`docs/ak70-9-api.md`](testing/stm32/nucleo-f446re/motor-api-tests/docs/ak70-9-api.md) for the motor CAN API reference.
 
 ## Tools and Hardware
 

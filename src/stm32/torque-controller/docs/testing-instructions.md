@@ -58,7 +58,7 @@ UART2 is routed through the ST-Link debugger on the Nucleo and appears as a virt
 
 1. Open STM32CubeIDE.
 2. Go to **File > Open Projects from File System**.
-3. Navigate to `stm32-tests/motor-api-tests` and select the folder.
+3. Navigate to `testing/stm32/nucleo-f446re/motor-api-tests` and select the folder.
 4. Click **Finish** to import the project.
 
 ### Enabling Float Formatting (Required)
@@ -133,7 +133,7 @@ Follow the [Finding Your COM Port](#finding-your-com-port) section above.
 Open a terminal and navigate to the `motor-api-tests` project folder:
 
 ```bash
-cd stm32-tests/motor-api-tests
+cd testing/stm32/nucleo-f446re/motor-api-tests
 ```
 
 Run the script with auto-detection:

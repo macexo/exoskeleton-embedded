@@ -169,7 +169,7 @@ Breadboard layout:
 
 1. Open STM32CubeIDE.
 2. Go to **File > Open Projects from File System**.
-3. Navigate to `testing/stm32/can-api` and select the folder.
+3. Navigate to `testing/stm32/nucleo-f446re/can-api` and select the folder.
 4. Click **Finish** to import the project.
 
 ### Enabling Float Formatting (Required)

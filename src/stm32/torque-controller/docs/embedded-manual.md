@@ -14,8 +14,8 @@ firmware.
 ### 1.2 Scope and Intended Audience
 
 **Scope:** the firmware in
-`testing/stm32/torque-controller/` and the companion Pi scripts in
-`testing/stm32/torque-controller/scripts/`. This is a single-joint, one-way
+`testing/stm32/nucleo-f446re/torque-controller/` and the companion Pi scripts in
+`testing/stm32/nucleo-f446re/torque-controller/scripts/`. This is a single-joint, one-way
 (Pi → motor) proof-of-concept. It does not cover IMU data paths, multi-motor
 coordination, or machine-learning control layers.
 
@@ -148,7 +148,7 @@ No I2C, SPI, or other interfaces are used by this project.
 #### 2.3.1 Firmware Structure
 
 ```
-testing/stm32/torque-controller/
+testing/stm32/nucleo-f446re/torque-controller/
 ├── Core/
 │   ├── Inc/
 │   │   ├── can/ak70_9.h          # VESC protocol API

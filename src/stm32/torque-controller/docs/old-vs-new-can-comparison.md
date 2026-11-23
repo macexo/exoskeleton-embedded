@@ -1,7 +1,7 @@
 # Old vs New CAN Implementation — Comparison
 
 This compares the CAN usage in the **production** folder (`src/`) with the
-**torque-controller test project** (`testing/stm32/torque-controller/`).
+**torque-controller test project** (`testing/stm32/nucleo-f446re/torque-controller/`).
 
 ## TL;DR
 
