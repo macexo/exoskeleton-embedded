@@ -40,3 +40,18 @@ resampling, signs, smoothing and controls are retained from the previous script.
 
 No hardware testing is claimed. Confirm motor mapping, direction, raw feedback,
 stop/expiry and IMU continuity on the unloaded bench before using automatic control.
+
+## Receive checks
+
+If commands send but telemetry is missing, first check `candump -n 20 can1`
+on the same interface. These applications use `python-can`'s default receive-all
+filter and do not share the custom SocketCAN mask bug fixed in
+[sensing-actuation PR #6](https://github.com/macexo/exoskeleton-sensing-actuation/pull/6).
+If adding raw socket filters, keep `CAN_ERR_FLAG` out of data-frame masks:
+Linux interprets that bit as an error-only subscription.
+
+With fresh IMUs but missing motors, check for forwarded status IDs `110`–`140`.
+An absent driver-ID label does not block forwarded status; `--motor-map` assigns
+labels and selects drivers in optional direct mode. Verify the actual firmware
+assignment before changing it. A sent torque/current frame does not confirm a
+motor reply or execution.
