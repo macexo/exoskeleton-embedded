@@ -29,6 +29,12 @@
 
 #include <stdint.h>
 
+/* CubeMars V3 Drive Software User Manual, section 2.3.1: servo feedback. */
+static inline uint32_t ak70_9_feedback_id(uint8_t motor_id)
+{
+    return (0x29U << 8) | motor_id;
+}
+
 /* ======================== Motor Configuration ============================= */
 
 #define MOTOR_CAN_ID               104       /* CAN ID of the AK70-9 motor */
@@ -150,7 +156,7 @@ void comm_can_set_duty(uint8_t controller_id, float duty);
  *
  * current: -60.0 to 60.0 amps
  */
-void comm_can_set_current(uint8_t controller_id, float current);
+int comm_can_set_current(uint8_t controller_id, float current);
 
 /*
  * Set the motor brake current.
@@ -185,7 +191,7 @@ void comm_can_set_pos(uint8_t controller_id, float pos);
  * set_origin_mode: 0 = temporary origin (lost on power cycle)
  *                  1 = permanent origin (saved to flash)
  */
-void comm_can_set_origin(uint8_t controller_id, uint8_t set_origin_mode);
+int comm_can_set_origin(uint8_t controller_id, uint8_t set_origin_mode);
 
 /*
  * Set motor position with velocity and acceleration limits.

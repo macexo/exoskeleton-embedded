@@ -52,3 +52,12 @@ def parse_motor_status(msg: can.Message) -> tuple[float, float, float, int, int]
     """
     raw_pos, raw_spd, raw_cur, temp, err = struct.unpack('<hhhbB', msg.data[0:8])
     return raw_pos / 10.0, raw_spd * 10.0, raw_cur / 100.0, temp, err
+
+
+def parse_current_setpoint(msg: can.Message) -> float:
+    """Decode STM32 post-conversion, post-clamp requested current in amps.
+
+    DLC 4, signed little-endian int32 milliamps. This is not measured current
+    and does not acknowledge delivery or application of the motor command.
+    """
+    return struct.unpack('<i', msg.data)[0] / 1000.0

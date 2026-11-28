@@ -226,10 +226,12 @@ def make_joint_state():
         # completed the pair. assemble_window() linearly interpolates onto a
         # fixed 10 ms grid from this buffer.
         "samples":         deque(maxlen=RAW_BUFFER_LEN),
+        "spi_sequence":    None,   # pending SPI accel sequence, per joint
         "temp_accel":      None,
         "temp_gyro":       None,
         "temp_motor_pos":  None,   # deg, parsed from the gyro frame
         "motor":           None,
+        "current_setpoint_a": None,
         # Diagnostics: track recent inter-arrival times so we can verify the
         # actual incoming rate at runtime. ~1 s of history is plenty.
         "intervals_ms":    deque(maxlen=256),
@@ -277,7 +279,7 @@ loop_stats = {
 # ─────────────────────────── CAN listener ───────────────────────────
 
 def process_msg(msg: can.Message):
-    if msg.is_extended_id:
+    if msg.is_extended_id or msg.is_remote_frame or msg.is_error_frame:
         return
     msg_type, src_node, dest = can_common.parse_can_id(msg.arbitration_id)
 
@@ -286,10 +288,6 @@ def process_msg(msg: can.Message):
     # an STM32 had sent it.
     if src_node == can_common.NODE_PI:
         return
-
-    if src_node in NODES:
-        with status_lock:
-            last_seen[src_node] = time.monotonic()
 
     if msg_type == can_common.MSG_ESTOP:
         try:
@@ -306,20 +304,42 @@ def process_msg(msg: can.Message):
 
     try:
         if msg_type == can_common.MSG_IMU_ACCEL:
-            joint["temp_accel"] = can_imu.parse_imu_accel(msg)
+            joint["temp_accel"] = None
+            joint["spi_sequence"] = None
+            if len(msg.data) == 8:
+                sequence, *axes = struct.unpack("<Hhhh", msg.data)
+                joint["spi_sequence"] = sequence
+                joint["temp_accel"] = tuple(raw * 0.000488 * 9.80665 for raw in axes)
+            elif len(msg.data) == 6:
+                joint["temp_accel"] = can_imu.parse_imu_accel(msg)
+            return
         elif msg_type == can_common.MSG_IMU_GYRO:
-            # The gyro frame now carries motor position alongside gyro xyz.
-            gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
-            joint["temp_gyro"] = (
-                gx * DEG_TO_RAD,
-                gy * DEG_TO_RAD,
-                gz * DEG_TO_RAD,
-            )
-            joint["temp_motor_pos"] = motor_pos   # deg, may be None
+            if joint["temp_accel"] is None:
+                return
+            if joint["spi_sequence"] is not None:
+                if len(msg.data) != 8:
+                    return
+                sequence, *axes = struct.unpack("<Hhhh", msg.data)
+                if sequence != joint["spi_sequence"]:
+                    return
+                joint["temp_gyro"] = tuple(math.radians(raw * 0.070) for raw in axes)
+                joint["temp_motor_pos"] = None  # supplied by MOTOR_STATUS
+            else:
+                if len(msg.data) not in (6, 8):
+                    return
+                gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
+                joint["temp_gyro"] = tuple(math.radians(axis) for axis in (gx, gy, gz))
+                joint["temp_motor_pos"] = motor_pos
+        elif msg_type == can_common.MSG_CURRENT_SETPOINT:
+            current = can_motor.parse_current_setpoint(msg)
+            with state_lock:
+                joint["current_setpoint_a"] = current
+            return
         elif msg_type == can_common.MSG_MOTOR_STATUS:
             position, speed, current, temperature, error = can_motor.parse_motor_status(msg)
             with state_lock:
                 joint["motor"] = {
+                    "received_at": time.monotonic(),
                     "position":    position,         # degrees
                     "speed":       speed,
                     "current":     current,
@@ -354,8 +374,15 @@ def process_msg(msg: can.Message):
         else:
             pos_deg = joint["temp_motor_pos"]
             if pos_deg is None and joint["motor"] is not None:
+                # SPI uses the up-to-100 Hz motor-status stream for encoder input.
+                # Drop the sample if four reporting intervals have elapsed.
+                if (joint["spi_sequence"] is not None and
+                        time.monotonic() - joint["motor"]["received_at"] >= 0.2):
+                    joint["temp_accel"] = None
+                    joint["temp_gyro"] = None
+                    return
                 pos_deg = joint["motor"]["position"]
-            if pos_deg is None and ALLOW_ENCODER_FALLBACK_ZERO:
+            if pos_deg is None and joint["spi_sequence"] is None and ALLOW_ENCODER_FALLBACK_ZERO:
                 pos_deg = 0.0
                 if not encoder_fallback_logged[src_node]:
                     print(f"\n[ENCODER] {NODES[src_node]} has no motor "
@@ -379,6 +406,9 @@ def process_msg(msg: can.Message):
                     dt_ms = (t_s - joint["last_pair_t_s"]) * 1000.0
                     joint["intervals_ms"].append(dt_ms)
                 joint["last_pair_t_s"] = t_s
+            # Status-only traffic cannot keep a stalled IMU online.
+            with status_lock:
+                last_seen[src_node] = time.monotonic()
         joint["temp_accel"] = None
         joint["temp_gyro"] = None
         joint["temp_motor_pos"] = None
@@ -875,6 +905,7 @@ _LOG_COLUMNS = (
     + _per_joint_cols(["ax", "ay", "az", "gx", "gy", "gz", "enc_rad"])
     + _per_joint_cols(["motor_pos_deg", "motor_speed_erpm",
                        "motor_current_a", "motor_temp_c", "motor_error"])
+    + _per_joint_cols(["current_setpoint_a"])
     + ["last_fault"]
 )
 
@@ -912,6 +943,7 @@ def _log_row() -> list:
                 "imu":      latest_imu,
                 "enc_rad":  latest_enc,
                 "motor":    dict(j["motor"]) if j["motor"] is not None else None,
+                "current_setpoint_a": j["current_setpoint_a"],
             }
 
     now = time.monotonic()
@@ -978,6 +1010,7 @@ def _log_row() -> list:
         else:
             row += [None, None, None, None, None]
 
+    row += [per_joint[nid]["current_setpoint_a"] for nid in _LOG_JOINT_ORDER]
     row.append(stats["last_fault"])
     return row
 
