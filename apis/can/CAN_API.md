@@ -90,6 +90,7 @@ Bit:  10  9  8  7  │  6  5  4  │  3  2  1  0
 | IMU_ACCEL | 0x3 | STM32 → Pi | 6 | Accelerometer XYZ |
 | IMU_GYRO | 0x4 | STM32 → Pi | 6 | Gyroscope XYZ |
 | HEARTBEAT | 0x5 | Any → All | 0 | Node alive signal (future use) |
+| CURRENT_SETPOINT | 0x6 | Joint → Pi | 4 | Signed little-endian int32 milliamps after torque conversion/current clamp |
 
 ### Example CAN IDs
 
@@ -677,3 +678,18 @@ candump can0 -c -t a
 ### "Old firmware compatibility"
 
 The old IDs (0x123, 0x124) conflict with the new ID scheme. **All nodes must run the new firmware.** Do not mix old and new firmware on the same bus.
+
+## Joint-controller current telemetry
+
+`CURRENT_SETPOINT` uses IDs `0x310`/`0x320`/`0x330`/`0x340` for left hip,
+right hip, left knee, and right knee. Decode the four-byte payload as `<i` and
+divide by 1000 for amps (`parse_current_setpoint`). For example, +5 A is
+`88 13 00 00`; -5 A is `78 EC FF FF`. It reports the STM32 desired current,
+not a motor acknowledgement, measured phase current, or DC input current.
+
+Joint-controller targets 100 Hz for this frame, including idle zero; explicit
+stops/timeouts/e-stop can report zero immediately. Diagnostic sends are suppressed
+during reset. Existing `MOTOR_STATUS` is unchanged in format and now forwards
+fresh driver feedback at up to 100 Hz (fault changes eligible immediately).
+Actual delivery depends on feedback frequency and CAN availability. The Pi CSV
+stores latest-value snapshots at 5 Hz, including `<joint>_current_setpoint_a`.
