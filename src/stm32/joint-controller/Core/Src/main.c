@@ -72,6 +72,7 @@
 #define CURRENT_LIMIT_A       5.0f
 #define TORQUE_PER_AMP        (0.159f * 9.0f)
 #define CURRENT_REFRESH_MS    50U
+#define MOTOR_TELEMETRY_MS    10U
 #define COMMAND_TIMEOUT_MS    200U
 
 #define IMU_ACCEL_CAN_ID     CAN_BUILD_ID(CAN_MSG_IMU_ACCEL, NODE_ID, CAN_NODE_PI)
@@ -140,6 +141,8 @@ static uint32_t last_current_tick;
 static uint8_t current_due;
 static uint8_t estop_latched;
 static uint8_t reset_pending;
+static uint8_t setpoint_due = 1;
+static uint32_t last_setpoint_tick;
 
 static void stop_motor(void)
 {
@@ -147,6 +150,7 @@ static void stop_motor(void)
   HAL_CAN_AbortTxRequest(&hcan1, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
   requested_current = 0;
   current_due = 1;
+  setpoint_due = 1;
 }
 
 /* Feedback and MOTOR_STATUS use the same fixed-point scales with opposite
@@ -160,7 +164,7 @@ static void motor_feedback(const CanFrame *frame, uint32_t now)
   if (frame->id != ak70_9_feedback_id(JOINT_MOTOR_ID) || frame->dlc != 8) return;
   if (!origin_set)
     origin_set = comm_can_set_origin(JOINT_MOTOR_ID, 0);
-  if (status_sent && now - last_status_tick < 50U && last_error == frame->data[7]) return;
+  if (status_sent && now - last_status_tick < MOTOR_TELEMETRY_MS && last_error == frame->data[7]) return;
   uint8_t status[8] = {
     frame->data[1], frame->data[0], frame->data[3], frame->data[2],
     frame->data[5], frame->data[4], frame->data[6], frame->data[7]
@@ -211,6 +215,18 @@ static void motor_service(void)
     if (comm_can_set_current(JOINT_MOTOR_ID, requested_current)) {
       current_due = 0;
       last_current_tick = now;
+    }
+  }
+  /* Desired post-clamp current, not measured current or a motor acknowledgement.
+     Match the driver's int32 milliamps conversion, but use network API LE order.
+     Try the motor command first; a full mailbox retries telemetry next iteration.
+     Reset must not wait for diagnostic traffic. */
+  if (!reset_pending && (setpoint_due || now - last_setpoint_tick >= MOTOR_TELEMETRY_MS)) {
+    uint32_t milliamps = (uint32_t)(int32_t)(requested_current * 1000.0f);
+    uint8_t data[4] = {milliamps, milliamps >> 8, milliamps >> 16, milliamps >> 24};
+    if (can_send_std(CAN_BUILD_ID(CAN_MSG_CURRENT_SETPOINT, NODE_ID, CAN_NODE_PI), data, 4)) {
+      setpoint_due = 0;
+      last_setpoint_tick = now;
     }
   }
   if (reset_pending && !current_due && HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 3)

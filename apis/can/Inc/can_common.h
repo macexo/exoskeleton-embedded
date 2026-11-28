@@ -28,6 +28,7 @@
 #define CAN_MSG_IMU_ACCEL    0x3
 #define CAN_MSG_IMU_GYRO     0x4
 #define CAN_MSG_HEARTBEAT    0x5
+#define CAN_MSG_CURRENT_SETPOINT 0x6
 
 /* ── CAN ID Construction ──
  * 11-bit standard ID layout:
