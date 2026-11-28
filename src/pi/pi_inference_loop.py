@@ -1429,7 +1429,7 @@ def main():
 
     print("Exoskeleton V3 SPI IMU Inference Loop")
     print(f"Motor feedback source: {feedback_source}; configured driver map: {motor_map}")
-    print("PR4 defaults: only node4->107; other nodes need JOINT_MOTOR_ID assignment")
+    print("Driver labels follow firmware JOINT_MOTOR_ID defaults; they do not configure motors")
     print("=" * 50)
     print(f"CAN interface:   {channel}")
     print(f"Inference URL:   {PREDICT_URL}")
