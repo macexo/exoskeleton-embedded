@@ -24,6 +24,23 @@ class JointInferenceTest(unittest.TestCase):
         loop.process_msg(can.Message(arbitration_id=(kind << 7) | (node << 4),
                                      is_extended_id=False, data=data, timestamp=timestamp))
 
+    def test_current_setpoint_decode_and_csv(self):
+        for node, milliamps in enumerate((5000, -5000, 0, 4891), 1):
+            self.receive(6, node, struct.pack("<i", milliamps))
+            self.assertEqual(loop.joints[node]["current_setpoint_a"], milliamps / 1000)
+            self.assertIsNone(loop.joints[node]["motor"])
+            self.assertIsNone(loop.last_seen[node])
+        row = loop._log_row()
+        self.assertEqual(len(row), len(loop._LOG_COLUMNS))
+        values = dict(zip(loop._LOG_COLUMNS, row))
+        for node, prefix in ((1, "hip_l"), (2, "hip_r"), (3, "knee_l"), (4, "knee_r")):
+            self.assertEqual(values[loop.NODES[node] + "_current_setpoint_a"],
+                             loop.joints[node]["current_setpoint_a"])
+        self.receive(6, 1, b"\x00\x00")  # Invalid DLC must not overwrite state.
+        self.assertEqual(loop.joints[1]["current_setpoint_a"], 5)
+        self.receive(6, 1, struct.pack("<i", 0))
+        self.assertEqual(loop.joints[1]["current_setpoint_a"], 0)
+
     def test_legacy_and_lost_spi_half(self):
         self.receive(3, 1, struct.pack("<hhh", 100, -200, 300))
         self.receive(4, 1, struct.pack("<hhhh", 0, 100, 0, 900))

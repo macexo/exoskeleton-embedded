@@ -22,6 +22,7 @@ MSG_MOTOR_STATUS = 0x2
 MSG_IMU_ACCEL    = 0x3
 MSG_IMU_GYRO     = 0x4
 MSG_HEARTBEAT    = 0x5
+MSG_CURRENT_SETPOINT = 0x6
 
 
 def build_can_id(msg_type: int, src_node: int, dest: int) -> int:

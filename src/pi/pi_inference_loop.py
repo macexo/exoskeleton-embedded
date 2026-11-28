@@ -231,6 +231,7 @@ def make_joint_state():
         "temp_gyro":       None,
         "temp_motor_pos":  None,   # deg, parsed from the gyro frame
         "motor":           None,
+        "current_setpoint_a": None,
         # Diagnostics: track recent inter-arrival times so we can verify the
         # actual incoming rate at runtime. ~1 s of history is plenty.
         "intervals_ms":    deque(maxlen=256),
@@ -329,6 +330,11 @@ def process_msg(msg: can.Message):
                 gx, gy, gz, motor_pos = can_imu.parse_imu_gyro_pos(msg)
                 joint["temp_gyro"] = tuple(math.radians(axis) for axis in (gx, gy, gz))
                 joint["temp_motor_pos"] = motor_pos
+        elif msg_type == can_common.MSG_CURRENT_SETPOINT:
+            current = can_motor.parse_current_setpoint(msg)
+            with state_lock:
+                joint["current_setpoint_a"] = current
+            return
         elif msg_type == can_common.MSG_MOTOR_STATUS:
             position, speed, current, temperature, error = can_motor.parse_motor_status(msg)
             with state_lock:
@@ -368,7 +374,7 @@ def process_msg(msg: can.Message):
         else:
             pos_deg = joint["temp_motor_pos"]
             if pos_deg is None and joint["motor"] is not None:
-                # SPI uses the 20 Hz motor-status stream for encoder input.
+                # SPI uses the up-to-100 Hz motor-status stream for encoder input.
                 # Drop the sample if four reporting intervals have elapsed.
                 if (joint["spi_sequence"] is not None and
                         time.monotonic() - joint["motor"]["received_at"] >= 0.2):
@@ -899,6 +905,7 @@ _LOG_COLUMNS = (
     + _per_joint_cols(["ax", "ay", "az", "gx", "gy", "gz", "enc_rad"])
     + _per_joint_cols(["motor_pos_deg", "motor_speed_erpm",
                        "motor_current_a", "motor_temp_c", "motor_error"])
+    + _per_joint_cols(["current_setpoint_a"])
     + ["last_fault"]
 )
 
@@ -936,6 +943,7 @@ def _log_row() -> list:
                 "imu":      latest_imu,
                 "enc_rad":  latest_enc,
                 "motor":    dict(j["motor"]) if j["motor"] is not None else None,
+                "current_setpoint_a": j["current_setpoint_a"],
             }
 
     now = time.monotonic()
@@ -1002,6 +1010,7 @@ def _log_row() -> list:
         else:
             row += [None, None, None, None, None]
 
+    row += [per_joint[nid]["current_setpoint_a"] for nid in _LOG_JOINT_ORDER]
     row.append(stats["last_fault"])
     return row
 
