@@ -53,12 +53,17 @@
 /* Same 11-bit layout as the joint controller's can_common.h:
      bits [10:7] message type, [6:4] source node, [3:0] destination (0 = Pi)
    Payload is this project's raw-count format, not the joint controller's */
-/* Zero reserves a telemetry-only build for boards without a motor assignment. */
+/* Motor addresses confirmed during the Sensing bench test.
+   Override JOINT_MOTOR_ID explicitly for a different motor or 0 for IMU-only. */
 #ifndef JOINT_MOTOR_ID
-#if NODE_ID == CAN_NODE_RIGHT_KNEE
+#if NODE_ID == CAN_NODE_LEFT_HIP
+#define JOINT_MOTOR_ID 104
+#elif NODE_ID == CAN_NODE_RIGHT_HIP
+#define JOINT_MOTOR_ID 105
+#elif NODE_ID == CAN_NODE_LEFT_KNEE
+#define JOINT_MOTOR_ID 106
+#elif NODE_ID == CAN_NODE_RIGHT_KNEE
 #define JOINT_MOTOR_ID 107
-#else
-#define JOINT_MOTOR_ID 0
 #endif
 #endif
 #if JOINT_MOTOR_ID < 0 || JOINT_MOTOR_ID > 255

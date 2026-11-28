@@ -1,10 +1,18 @@
 # Joint controller
 
 Build `joint-controller` in STM32CubeIDE for the STM32F446 Sensing PCB.
-Set `NODE_ID` and `JOINT_MOTOR_ID` for the physical joint in the build
-configuration. The default is right knee (node 4, motor 107), matching the
-previous Embedded controller. Other nodes default to IMU-only until assigned
-a motor. PC13 flashes the node number at startup and toggles on successful
+Set `NODE_ID` for the physical joint in the build configuration. The default
+is right knee (node 4). The motor ID follows the confirmed Sensing map.
+
+| Joint | Node ID | Default motor ID |
+| --- | --- | --- |
+| Left hip | 1 | 104 |
+| Right hip | 2 | 105 |
+| Left knee | 3 | 106 |
+| Right knee | 4 | 107 |
+
+Override `JOINT_MOTOR_ID` for a different motor or set it to 0 for IMU-only.
+PC13 flashes the node number at startup and toggles on successful
 IMU streaming. A solid LED indicates a read, send, or stale-sample condition.
 
 ## CAN and SPI
