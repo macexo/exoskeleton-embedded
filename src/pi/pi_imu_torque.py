@@ -1,449 +1,907 @@
+#!/usr/bin/env python3
 """
 pi_imu_torque.py
 
-Combined IMU buffering and torque commanding for the McMaster Exoskeleton Pi.
+Manual torque control and combined IMU/motor logging for the V3 joint-controller bench.
+Sensing-actuation's bench-tested motor console, keeping this script's command/listener pattern.
 
-A background listener thread fans out CAN frames by message type:
-  - IMU_ACCEL / IMU_GYRO: paired per joint, downsampled 417 Hz -> 187 Hz with
-    a Bresenham accumulator, and pushed into a per-joint deque
-    (matches pi_can_buffer.py).
-  - Direct extended motor feedback: stored independently per joint.
-  - ESTOP: logged to the console.
-The foreground loop is an interactive prompt that sends torque commands and
-queries the buffered IMU / motor state. It mirrors torque_cmd.py for the
-sending side and pi_can_buffer.py for the receiving side.
-
-Use as ML template:
-    Replace the prompt loop with an inference loop that:
-      1. pulls the latest IMU window via get_imu_data(node_id),
-      2. runs the model to produce a desired torque per joint,
-      3. sends torque with send_torque(node_id, torque_nm).
-    The CAN listener thread keeps IMU and motor-status state fresh in the
-    background; the model only needs to read snapshots and emit commands.
+Background workers receive CAN frames and keep active torque requests refreshed:
+  - IMU_ACCEL / IMU_GYRO: pair V3 raw XYZ frames per joint and sequence.
+  - MOTOR_STATUS: retain the latest STM32-forwarded feedback per joint.
+    Direct extended motor feedback is available as an explicit option.
+  - ESTOP: clear active requests and latch the console's software stop.
+  - Torque requests: refresh every 50 ms against the firmware's 200 ms expiry.
+The foreground prompt sends manual requests and queries IMU queues/motor status.
+CSV records raw frames, decoded telemetry and command events; sent requests do
+not confirm motor execution. Quit, EOF and Ctrl+C clear requests and attempt stop.
 
 Setup (run once on the Pi):
     sudo ip link set can1 up type can bitrate 1000000
 
-Usage:
-    python3 pi_imu_torque.py [can_interface]   # default can_interface = can1
+Usage (each run creates a new CSV, by default in src/pi/logs/; never overwritten):
+    python3 src/pi/pi_imu_torque.py [can_interface]   # default can_interface = can1
+    python3 src/pi/pi_imu_torque.py can1 --out bench_001.csv
+
+Python 3.10+ with python-can, for the shared apis/can/python decoders; live CAN
+requires Linux SocketCAN. Keep console_telemetry.py alongside this script.
+See README.md for commands, protocol details and bench checks.
 """
 
 import argparse
+import csv
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
+from pathlib import Path
+import socket
+import struct
 import sys
 import threading
 import time
-from collections import deque
-from pathlib import Path
-from time import sleep
 
-import can
+from console_telemetry import IMUState, PAYLOAD_FORMAT, decode_imu_id, imu_ids, parse_motor_status
 
 try:
-    import can_common
     import can_v3
-    import can_motor
-    import can_system
 except ImportError:
     REPO_ROOT = Path(__file__).resolve().parents[2]
+
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from apis.can.python import can_common, can_v3, can_motor, can_system
 
-# V3 streams sequence-paired raw accel+gyro at 417 Hz. The ML model wants 187 Hz, so we
-# downsample with a Bresenham-style accumulator below: every paired sample adds
-# `target` to an accumulator and emits one entry whenever it crosses `hz`. This
-# spreads the kept samples uniformly without timer jitter.
-hz = can_v3.SAMPLE_RATE_HZ
-target = 187
-imu_receiver = can_v3.ImuReceiver()
-motor_map = dict(can_v3.DEFAULT_MOTOR_MAP)
-feedback_source = "forwarded"
+    from apis.can.python import can_v3
 
-# AK70-9 KV60 effective torque constant (Kt * gear_ratio). Used only to display
-# the implied current to the operator; the STM32 does the real conversion.
-KT_EFFECTIVE = 1.431  # Nm/A
+# Joint node IDs used by t, t_all, l1-l4, q1-q4 and m1-m4.
+JOINTS = {1: "left hip", 2: "right hip", 3: "left knee", 4: "right knee"}
 
-# Test-safe display ceiling — matches the STM32's 5 A current clamp.
-TORQUE_LIMIT = 5.0 * KT_EFFECTIVE  # ~7.155 Nm
+# Pi attribution: labels feedback rows and m1-m4, and selects drivers in direct mode;
+# each board's firmware JOINT_MOTOR_ID selects its motor. Defaults: 1:104 ... 4:107.
+DEFAULT_MOTOR_MAP = dict(can_v3.DEFAULT_MOTOR_MAP)
 
-# Joint mapping. Node ID -> short label. The numeric suffix used in the prompt
-# (q1, l1, m1, t 1 ...) matches the node ID directly.
-NODES = {
-    can_common.NODE_LEFT_HIP:   "left_hip",
-    can_common.NODE_RIGHT_HIP:  "right_hip",
-    can_common.NODE_LEFT_KNEE:  "left_knee",
-    can_common.NODE_RIGHT_KNEE: "right_knee",
-}
+# Nominal torque/current conversion and bench request ceiling; not calibration.
+# The STM32 performs the conversion and applies its own current clamp.
+KT_NM_PER_A = 1.431  # 0.159 Nm/A * 9 reduction.
+BENCH_CURRENT_LIMIT_A = 5.0
+TORQUE_LIMIT_NM = 7.155  # KT_NM_PER_A * BENCH_CURRENT_LIMIT_A.
 
+# Timing in seconds: expected firmware expiry, Pi refresh, stale age and CSV status.
+FIRMWARE_TIMEOUT_S = 0.200
+REFRESH_S = 0.050
+STALE_S = 0.500
+STATUS_S = 1.0
 
-def make_joint_state():
-    return {
-        # IMU pairing + downsampling state
-        "accumulator": 0,
-        "queue": deque(maxlen=target),
-        # Latest full motor status snapshot (or None until a frame arrives)
-        "motor": None,
-    }
+# Default CSV directory, shared with pi_inference_loop.py session logs.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
 
+# Linux classic SocketCAN frame flags, masks and wire layout.
+CAN_EFF_FLAG = 0x80000000
+CAN_RTR_FLAG = 0x40000000
+CAN_ERR_FLAG = 0x20000000
+CAN_EFF_MASK = 0x1FFFFFFF
+CAN_SFF_MASK = 0x7FF
+CAN_FRAME = struct.Struct("=IB3x8s")
 
-joints = {node_id: make_joint_state() for node_id in NODES}
-state_lock = threading.Lock()
+# Raw driver feedback function, optional Linux RX metadata and Pi ESTOP reason.
+FEEDBACK_FUNCTION = 0x29
+SO_TIMESTAMP = getattr(socket, "SO_TIMESTAMP", 29)
+SO_RXQ_OVFL = getattr(socket, "SO_RXQ_OVFL", 40)
+ESTOP_REASON = 1
 
-# ── Real-time fault tracking ──
-# Edge-triggered: log on state change, not on every frame. We only consider a
-# joint "stale" once we've heard from it at least once, so empty buses on
-# startup don't produce spurious warnings.
-STALE_THRESHOLD_S    = 1.0   # silent for >1s -> stale
-WATCHDOG_INTERVAL_S  = 0.5
-
-last_seen           = {nid: None for nid in NODES}
-prev_motor_error_pi = {nid: 0 for nid in NODES}
-stale_state         = {nid: False for nid in NODES}
-status_lock         = threading.Lock()
-
-def stale_watchdog():
-    """Edge-log when a known joint goes silent for >STALE_THRESHOLD_S, and
-    again when traffic resumes. Runs in its own thread."""
-    while True:
-        sleep(WATCHDOG_INTERVAL_S)
-        now = time.monotonic()
-        with status_lock:
-            for nid, last in last_seen.items():
-                if last is None:
-                    continue  # never heard from this joint -> not "stale", just absent
-                age = now - last
-                is_stale = age > STALE_THRESHOLD_S
-                if is_stale and not stale_state[nid]:
-                    print(f"\n[STALE] {NODES[nid]} silent for {age:.1f}s")
-                    stale_state[nid] = True
-                elif not is_stale and stale_state[nid]:
-                    print(f"\n[ALIVE] {NODES[nid]} traffic resumed")
-                    stale_state[nid] = False
+# Stable CSV column order; blank telemetry fields represent unavailable data.
+CSV_COLUMNS = (
+    "timestamp_utc", "elapsed_s", "event", "raw_can_id", "arbitration_id",
+    "extended", "dlc", "payload_hex", "joint", "joint_name", "motor_id",
+    "requested_torque_nm", "sent_torque_nm", "feedback_state", "feedback_age_s",
+    "position_deg", "speed_erpm", "phase_current_a", "driver_temperature_c",
+    "fault_code", "feedback_source", "imu_sequence", "imu_pair_state",
+    "imu_state", "imu_age_s", "ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw",
+    "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "imu_pairs", "imu_missing",
+    "imu_jumps", "imu_rate_hz", "timestamp_source", "rx_socket_drops", "detail",
+)
 
 
-def process_msg(msg: can.Message):
-    """Receive V3 sequence-paired IMUs and independent motor feedback."""
-    feedback = can_v3.decode_motor_feedback(msg, motor_map, feedback_source)
-    if feedback is not None:
-        node, motor = feedback
-        with state_lock:
-            joints[node]["motor"] = motor
-        with status_lock:
-            if motor["error"] != prev_motor_error_pi[node]:
-                print(f"\n[MOTOR] {NODES[node]} fault "
-                      f"{prev_motor_error_pi[node]} -> {motor['error']}")
-                prev_motor_error_pi[node] = motor["error"]
-        return
-    if (not msg.is_extended_id and msg.arbitration_id == 0 and msg.dlc == 1
-            and len(msg.data) == 1 and not msg.is_remote_frame
-            and not msg.is_error_frame and not msg.is_fd):
-        print(f"\n[ESTOP] reason {msg.data[0]}")
-        return
-    pair = imu_receiver.process(msg)
-    if pair is None:
-        return
-    node = pair.node
-    with state_lock:
-        joint = joints[node]
-        if pair.discontinuity:
-            joint["queue"].clear()
-            joint["accumulator"] = 0
-        joint["accumulator"] += target
-        if joint["accumulator"] >= hz:
-            motor = joint["motor"]
-            position = motor["position"] if can_v3.fresh_motor(motor) else None
-            # Public tuple shape retained; acceleration m/s², gyro degrees/s.
-            joint["queue"].append((pair.timestamp * 1000.0, pair.gyro_dps,
-                                   pair.accel_mps2, position))
-            joint["accumulator"] -= hz
-    with status_lock:
-        first = last_seen[node] is None
-        last_seen[node] = time.monotonic()
-        stale_state[node] = False
-    if first:
-        print(f"\n[NODE] first complete V3 IMU pair from {NODES[node]}")
+class CommandError(ValueError):
+    """An invalid operator command that does not terminate a healthy console."""
 
 
-def can_listener(bus: can.Bus):
-    """Long-running RX loop. Self-recovers from transient bus errors so a
-    short cable wiggle doesn't kill the listener thread."""
-    while True:
-        try:
-            msg = bus.recv(timeout=1.0)
-        except can.CanError as e:
-            print(f"\n[CAN] bus recv error: {e} (retry in 0.5 s)")
-            sleep(0.5)
-            continue
-        if msg is None:
-            continue
-        try:
-            process_msg(msg)
-        except Exception as e:
-            print(f"\n[CAN] error processing frame 0x{msg.arbitration_id:X}: {e}")
+@dataclass(frozen=True)
+class Frame:
+    """Classic CAN frame; raw_id includes SocketCAN EFF/RTR/ERR flags."""
+
+    raw_id: int
+    data: bytes
+    dlc: int
+    is_fd: bool = False
+    received_wall: float = None
+    received_monotonic: float = None
+    socket_drops: int = None
+
+    @property
+    def arbitration_id(self):
+        return self.raw_id & (CAN_EFF_MASK if self.extended else CAN_SFF_MASK)
+
+    @property
+    def extended(self):
+        return bool(self.raw_id & CAN_EFF_FLAG)
 
 
-def get_imu_data(node_id: int):
-    """Public accessor: return a snapshot of the buffered IMU samples."""
-    if node_id not in joints:
-        return []
-    with state_lock:
-        return list(joints[node_id]["queue"])
+@dataclass(frozen=True)
+class Feedback:
+    """One actual received feedback sample, separate from requested torque."""
+
+    joint: int
+    motor_id: int
+    received_at: float
+    position_deg: float
+    speed_erpm: int
+    phase_current_a: float
+    driver_temperature_c: int
+    fault_code: int
+    source: str = "forwarded"
+
+    def fields(self):
+        return {name: getattr(self, name) for name in (
+            "position_deg", "speed_erpm", "phase_current_a", "driver_temperature_c",
+            "fault_code",
+        )}
 
 
-def get_motor_status(node_id: int):
-    """Public accessor: return the latest motor status dict, or None."""
-    if node_id not in joints:
-        return None
-    with state_lock:
-        snap = joints[node_id]["motor"]
-        if snap is None:
-            return None
-        result = dict(snap)
-    result["age_s"] = max(0.0, time.monotonic() - result["received_at"],
-                          (time.time() * 1000.0 - result["timestamp"]) / 1000.0)
-    result["stale"] = not can_v3.fresh_motor(result)
-    return result
+def validate_motor_map(motor_map):
+    """Validate optional attribution, without implying every joint has a motor."""
+
+    if (not motor_map or any(type(joint) is not int or joint not in JOINTS for joint in motor_map)):
+        raise ValueError("motor map must specify one or more distinct joints in 1..4")
+    if any(type(driver) is not int or not 1 <= driver <= 255 for driver in motor_map.values()):
+        raise ValueError("motor IDs must be integers in 1..255")
+    if len(set(motor_map.values())) != len(motor_map):
+        raise ValueError("motor IDs must be unique")
+
+    return dict(motor_map)
 
 
-def send_torque(bus: can.Bus, node_id: int, torque_nm: float):
-    """Forward a validated request; return whether the local send succeeded."""
-    if (type(node_id) is not int or node_id not in NODES
-            or not math.isfinite(torque_nm) or abs(torque_nm) > TORQUE_LIMIT):
-        raise ValueError(f"joint must be 1..4 and torque finite within +/-{TORQUE_LIMIT:.3f} Nm")
+def parse_motor_map(value):
+    """Parse attribution labels such as --motor-map 4:107 (default 1:104,2:105,3:106,4:107)."""
+
     try:
-        can_motor.send_torque_cmd(bus, node_id, torque_nm)
-    except can.CanError as e:
-        print(f"[CAN] send_torque to {NODES.get(node_id, node_id)} failed: {e}")
-        return False
-    return True
+        pairs = [entry.split(":") for entry in value.split(",")]
+
+        if any(len(pair) != 2 for pair in pairs):
+            raise ValueError("expected joint:motor pairs")
+
+        result = {int(joint): int(driver) for joint, driver in pairs}
+
+        if len(result) != len(pairs):
+            raise ValueError("each joint may appear only once")
+
+        return validate_motor_map(result)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
-def _fmt_pos(pos):
-    return f"{pos:7.2f}" if pos is not None else "    N/A"
+def torque_frame(joint, torque_nm):
+    """Encode Pi source 0, TORQUE_CMD type 1; reject invalid/unsafe requests."""
+
+    if (type(joint) is not int or joint not in JOINTS):
+        raise ValueError("joint must be 1, 2, 3, or 4")
+    if (not math.isfinite(torque_nm) or abs(torque_nm) > TORQUE_LIMIT_NM):
+        raise ValueError(f"torque must be finite and within +/-{TORQUE_LIMIT_NM:.3f} Nm")
+
+    raw = int(round(torque_nm * 1000.0))
+
+    return Frame((1 << 7) | joint, struct.pack("<h", raw), 2)
 
 
-def print_full_queue(node_id: int):
-    data = get_imu_data(node_id)
-    label = NODES[node_id]
-    if not data:
-        print(f"[{label}] empty queue, wait a second")
-        return
+def decode_feedback(frame, motor_map, received_at, source="forwarded"):
+    """Decode one selected stream: STM32-forwarded status or explicit raw function 0x29.
 
-    print(f"\n[{label}] queue snapshot ({len(data)} samples)")
-    for i, (timestamp, gyro, accel, motor_pos) in enumerate(data, start=1):
-        print(
-            f"[{i:3}] Time: {timestamp:.4f} | "
-            f"Gyro deg/s: {gyro[0]:6.2f}, {gyro[1]:6.2f}, {gyro[2]:6.2f} | "
-            f"Accel m/s²: {accel[0]:6.2f}, {accel[1]:6.2f}, {accel[2]:6.2f} | "
-            f"Pos: {_fmt_pos(motor_pos)} deg"
-        )
-    print()
+    Forwarded payload/scaling reuses last year's can_motor.parse_motor_status
+    semantics. Exact identifiers and eight-byte classic data frames are required.
+    Direct and forwarded streams are never silently mixed.
+    """
 
+    if (frame.is_fd or frame.raw_id & (CAN_RTR_FLAG | CAN_ERR_FLAG) or frame.dlc != 8 or len(frame.data) != 8):
+        return None
+    if source == "forwarded":
+        joint = next((joint for joint in JOINTS if frame.raw_id == (0x100 | (joint << 4))), None)
 
-def print_latest_imu(node_id: int):
-    data = get_imu_data(node_id)
-    label = NODES[node_id]
-    if not data:
-        print(f"[{label}] empty queue, wait a second")
-        return
+        if joint is None:
+            return None
 
-    timestamp, gyro, accel, motor_pos = data[-1]
-    print(f"\n[{label}] latest IMU sample (queue depth {len(data)})")
-    print(f"  time (ms):     {timestamp:.4f}")
-    print(f"  gyro deg/s:    {gyro}")
-    print(f"  accel m/s²:    {accel}")
-    print(f"  motor pos deg: {_fmt_pos(motor_pos)}")
-    print()
+        driver = motor_map.get(joint)
+        values = parse_motor_status(frame.data)
+    elif source == "direct":
+        if (not frame.extended or (frame.raw_id & CAN_EFF_MASK) >> 8 != FEEDBACK_FUNCTION):
+            return None
 
+        driver = frame.raw_id & 0xFF
+        joint = next((joint for joint, motor in motor_map.items() if motor == driver), None)
 
-def print_motor_status(node_id: int):
-    snap = get_motor_status(node_id)
-    label = NODES[node_id]
-    if snap is None:
-        print(f"[{label}] no motor status received yet")
-        return
+        if joint is None:
+            return None
 
-    print(f"\n[{label}] last motor feedback "
-          f"({'STALE' if snap['stale'] else 'fresh'}, age {snap['age_s']:.3f} s)")
-    print(f"  time (ms):   {snap['timestamp']:.4f}")
-    print(f"  position:    {snap['position']:.2f} deg")
-    print(f"  speed:       {snap['speed']:.0f} ERPM")
-    print(f"  phase current: {snap['phase_current']:.2f} A")
-    print(f"  temperature: {snap['temperature']} C")
-    print(f"  error:       {snap['error']}")
-    print()
+        position, speed, phase_current, temperature, fault = struct.unpack(">hhhbB", frame.data)
+        values = position / 10.0, speed * 10.0, phase_current / 100.0, temperature, fault
+    else:
+        raise ValueError("feedback source must be forwarded or direct")
+
+    return Feedback(joint, driver, received_at, *values, source=source)
 
 
-def print_help():
-    print("\ncommands:")
-    for nid, label in NODES.items():
-        print(f"  q{nid}              IMU queue snapshot for {label}")
-    for nid, label in NODES.items():
-        print(f"  l{nid}              latest IMU sample for {label}")
-    for nid, label in NODES.items():
-        print(f"  m{nid}              latest motor status for {label}")
-    print("  t <node> <Nm>   send torque to a joint (node = 1..4)")
-    print("  t_all <Nm>      request the same torque on all joints (alias: tall)")
-    print("  tstop           zero torque on all joints")
-    print("  estop           broadcast ESTOP (latches each STM32)")
-    print("  h               show this help")
-    print("  quit            exit (broadcasts ESTOP first as a safety)")
-    print(f"\ntorque range: +/- {TORQUE_LIMIT:.2f} Nm (STM32 clamps to its current limit)")
-    print()
+def is_estop(frame):
+    """Recognize the shared Pi software ESTOP format, including frame-type checks."""
+
+    return (not frame.is_fd and frame.raw_id == 0 and frame.dlc == 1 and len(frame.data) == 1)
 
 
-def parse_query_command(token: str):
-    """Return (kind, node_id) for q<n>/l<n>/m<n> tokens, or (None, None)."""
-    if len(token) != 2 or token[0] not in {"q", "l", "m"} or not token[1].isdigit():
-        return (None, None)
-    node_id = int(token[1])
-    if node_id not in NODES:
-        return (None, None)
-    return (token[0], node_id)
+class SocketCAN:
+    """Small Linux classic SocketCAN transport; concurrent send and receive are supported."""
+
+    def __init__(self, channel, motor_map, feedback_source="forwarded"):
+        if not hasattr(socket, "AF_CAN"):
+            raise OSError("SocketCAN requires Linux; tests can run on other operating systems")
+
+        self.sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+
+        try:
+            # CAN_ERR_FLAG in a filter mask selects Linux error-only reception.
+            standard_mask = CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_SFF_MASK
+            standard_ids = [identifier for joint in JOINTS for identifier in imu_ids(joint)]
+            standard_ids.append(0)
+
+            if feedback_source == "forwarded":
+                standard_ids.extend(0x100 | (joint << 4) for joint in JOINTS)
+            elif feedback_source != "direct":
+                raise ValueError("feedback source must be forwarded or direct")
+
+            filters = [(identifier, standard_mask) for identifier in standard_ids]
+
+            if feedback_source == "direct":
+                mask = CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_EFF_MASK
+                filters.extend((CAN_EFF_FLAG | (FEEDBACK_FUNCTION << 8) | driver, mask) for driver in motor_map.values())
+
+            self.sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, b"".join(struct.pack("=II", *entry) for entry in filters))
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+
+            for option in (SO_TIMESTAMP, SO_RXQ_OVFL):
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, option, 1)
+                except OSError:
+                    pass  # Optional kernel timestamp/drop metadata, as in sensing's imu_canbus.py.
+
+            # Bound send/recv so a busy or silent bus cannot hold the stop lock indefinitely.
+            self.sock.settimeout(0.020)
+            self.sock.bind((channel,))
+        except BaseException:
+            self.sock.close()
+
+            raise
+
+    def send(self, frame):
+        """Queue one frame; success is kernel acceptance, never proof of motor execution."""
+
+        packet = CAN_FRAME.pack(frame.raw_id, frame.dlc, frame.data.ljust(8, b"\0"))
+
+        if self.sock.send(packet) != CAN_FRAME.size:
+            raise OSError("short SocketCAN send")
+
+    def recv(self):
+        """Receive a classic frame with optional kernel timestamp/drop metadata.
+
+        Ancillary parsing follows sensing's imu_canbus.recv_frame, preserving raw ID flags
+        and rejecting non-classic sizes instead of masking extended IDs to 11 bits.
+        """
+
+        try:
+            packet, ancillary, _, _ = self.sock.recvmsg(72, socket.CMSG_SPACE(16) * 2)
+        except socket.timeout:
+            return None
+
+        if len(packet) != CAN_FRAME.size:
+            return None
+
+        received_wall = None
+        drops = None
+
+        for level, kind, data in ancillary:
+            if level != socket.SOL_SOCKET:
+                continue
+
+            if (kind == SO_TIMESTAMP and len(data) in (8, 16)):
+                seconds, micros = struct.unpack("=qq" if len(data) == 16 else "=ii", data)
+                received_wall = seconds + micros / 1e6
+            elif (kind == SO_RXQ_OVFL and len(data) >= 4):
+                drops = struct.unpack("=I", data[:4])[0]
+
+        observed_mono = time.monotonic()
+
+        if received_wall is not None:
+            observed_mono -= max(0.0, time.time() - received_wall)
+
+        raw_id, dlc, data = CAN_FRAME.unpack(packet)
+
+        return Frame(raw_id, data[:min(dlc, 8)], dlc, received_wall=received_wall, received_monotonic=observed_mono, socket_drops=drops)
+
+    def close(self):
+        self.sock.close()
 
 
-def handle_command(bus: can.Bus, raw: str) -> bool:
-    """Dispatch a single line of user input. Returns False to exit."""
-    parts = raw.strip().lower().split()
+class CSVLog:
+    """Thread-safe, immediately flushed event CSV; empty fields represent missing data."""
+
+    def __init__(self, output):
+        self.output = output
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        self.writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
+        self.writer.writeheader()
+        output.flush()
+
+    def write(self, event, frame=None, **fields):
+        row = {"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+               "elapsed_s": f"{time.monotonic() - self.started:.6f}",
+               "event": event}
+
+        if frame is not None:
+            if frame.received_wall is not None:
+                row["timestamp_utc"] = datetime.fromtimestamp(
+                    frame.received_wall, timezone.utc).isoformat(timespec="microseconds")
+
+            row.update(timestamp_source="kernel" if frame.received_wall is not None else "userspace",
+                       rx_socket_drops="" if frame.socket_drops is None else frame.socket_drops)
+            row.update(raw_can_id=f"0x{frame.raw_id:08X}",
+                       arbitration_id=f"0x{frame.arbitration_id:X}",
+                       extended=int(frame.extended), dlc=frame.dlc, payload_hex=frame.data.hex())
+
+        row.update(fields)
+
+        with self.lock:
+            self.writer.writerow(row)
+            self.output.flush()
+
+
+class MotorConsole:
+    """Coordinate requested commands, refresh, V3 IMU/motor telemetry, and fail-closed shutdown.
+
+    The command lock covers both the active set and sends. Once stop acquires it,
+    no earlier refresh can send a nonzero command after the stop frames.
+    """
+
+    def __init__(self, transport, logger, motor_map=None, refresh_s=REFRESH_S,
+                 stale_s=STALE_S, clock=time.monotonic, report=print,
+                 feedback_source="forwarded"):
+        self.transport = transport
+        self.logger = logger
+        self.motor_map = validate_motor_map(DEFAULT_MOTOR_MAP if motor_map is None else motor_map)
+
+        if feedback_source not in ("forwarded", "direct"):
+            raise ValueError("feedback source must be forwarded or direct")
+
+        self.feedback_source = feedback_source
+
+        if (not math.isfinite(refresh_s) or not 0.010 <= refresh_s <= 0.100):
+            raise ValueError("refresh interval must be 0.010..0.100 s (firmware timeout 0.200 s)")
+        if (not math.isfinite(stale_s) or stale_s <= 0):
+            raise ValueError("stale interval must be positive and finite")
+
+        self.refresh_s = refresh_s
+        self.stale_s = stale_s
+        self.clock = clock
+        self.report = report
+        self.command_lock = threading.RLock()
+        self.feedback_lock = threading.Lock()
+        self.active = {}
+        self.latest = {}
+        self.imu = {joint: IMUState(joint) for joint in JOINTS}
+        self.socket_drops = 0
+        self.estopped = False
+        self.shutdown = threading.Event()
+        self.failure = None
+        self.threads = []
+        self.closed = False
+
+    def identity(self, joint):
+        return {"joint": joint, "joint_name": JOINTS[joint], "motor_id": self.motor_map.get(joint)}
+
+    def _send_torque(self, joint, requested, event):
+        frame = torque_frame(joint, requested)
+        sent = struct.unpack("<h", frame.data)[0] / 1000.0
+
+        try:
+            self.transport.send(frame)
+        except Exception as error:
+            self.logger.write("send_failed", frame, **self.identity(joint), requested_torque_nm=requested, detail=str(error))
+
+            raise
+
+        self.logger.write(event, frame, **self.identity(joint), requested_torque_nm=requested, sent_torque_nm=sent)
+
+        return sent
+
+    def set_torque(self, joints, requested):
+        """Send an immediate request and retain nonzero encoded commands for refresh."""
+
+        try:
+            for joint in joints:
+                torque_frame(joint, requested)  # Validate before partial fan-out.
+        except ValueError as error:
+            raise CommandError(str(error)) from error
+
+        with self.command_lock:
+            if (self.shutdown.is_set() or self.closed):
+                raise RuntimeError("console is shutting down")
+            if self.estopped:
+                raise CommandError("software ESTOP is latched; reset boards and restart the console")
+
+            try:
+                for joint in joints:
+                    sent = self._send_torque(joint, requested, "command")
+
+                    if sent:
+                        self.active[joint] = requested
+                    else:
+                        self.active.pop(joint, None)
+
+                    self.report(f"joint {joint}: requested {requested:.6g} Nm, sent {sent:.3f} Nm (execution unconfirmed)")
+            except BaseException:
+                self.stop("command exception")
+
+                raise
+
+    def stop(self, reason="tstop", estop=False):
+        """Cancel refresh atomically and attempt every zero even if one send/log fails.
+
+        ESTOP is sent first when requested, then all four explicit zero requests.
+        Returns error strings; never lets a failed CSV write prevent a stop attempt.
+        """
+
+        errors = []
+
+        with self.command_lock:
+            self.active.clear()
+
+            if estop:
+                self.estopped = True
+                frame = Frame(0, bytes([ESTOP_REASON]), 1)
+
+                try:
+                    self.transport.send(frame)
+                except Exception as error:
+                    errors.append(f"ESTOP send: {error}")
+                    event = "send_failed"
+                else:
+                    event = "estop"
+
+                try:
+                    self.logger.write(event, frame, detail=reason)
+                except Exception as error:
+                    errors.append(f"CSV: {error}")
+
+            for joint in JOINTS:
+                try:
+                    self._send_torque(joint, 0.0, "stop")
+                except Exception as error:
+                    errors.append(f"joint {joint} stop: {error}")
+
+            try:
+                self.logger.write("commands_cleared", detail=reason)
+            except Exception as error:
+                errors.append(f"CSV: {error}")
+
+        for error in errors:
+            self.report(f"[STOP ATTEMPT FAILED] {error}")
+
+        return errors
+
+    def refresh_once(self):
+        """Refresh only the active set; failures cancel all requests and attempt stop."""
+
+        with self.command_lock:
+            if self.shutdown.is_set():
+                return
+
+            try:
+                for joint, requested in self.active.items():
+                    self._send_torque(joint, requested, "refresh")
+            except BaseException:
+                self.stop("refresh exception")
+
+                raise
+
+    def process_frame(self, frame):
+        """Fan out telemetry by type, following the familiar Pi listener structure."""
+
+        if (frame.socket_drops is not None and frame.socket_drops != self.socket_drops):
+            self.socket_drops = frame.socket_drops
+            self.report(f"[CAN] receive socket cumulative drops: {self.socket_drops}")
+
+        received_at = (self.clock() if frame.received_monotonic is None else frame.received_monotonic)
+
+        if is_estop(frame):
+            with self.command_lock:
+                self.estopped = True
+                self.active.clear()
+                self.logger.write("estop_received", frame, detail=f"reason={frame.data[0]}")
+                self.stop("received software ESTOP")
+
+            return
+
+        imu_id = decode_imu_id(frame.raw_id)
+
+        if (imu_id is not None and not frame.is_fd and frame.dlc == 8 and len(frame.data) == 8):
+            joint, kind = imu_id
+            sequence, *axes = struct.unpack(PAYLOAD_FORMAT, frame.data)
+
+            with self.feedback_lock:
+                sample = self.imu[joint].add_frame(kind, sequence, tuple(axes), received_at)
+
+            axis_names = (("ax_raw", "ay_raw", "az_raw") if kind == 3 else ("gx_raw", "gy_raw", "gz_raw"))
+            self.logger.write("imu_accel" if kind == 3 else "imu_gyro", frame,
+                              **self.identity(joint), imu_sequence=sequence,
+                              imu_pair_state="paired" if sample else "waiting",
+                              **dict(zip(axis_names, axes)))
+
+            if sample is not None:
+                self.logger.write("imu_pair", **self.identity(joint),
+                                  imu_pair_state="paired", imu_state="received",
+                                  imu_age_s=f"{max(0.0, self.clock() - received_at):.6f}",
+                                  **sample.fields())
+
+            return
+
+        feedback = decode_feedback(frame, self.motor_map, received_at, self.feedback_source)
+
+        if feedback is None:
+            return
+
+        with self.feedback_lock:
+            self.latest[feedback.joint] = feedback
+
+        self.logger.write("feedback", frame, **self.identity(feedback.joint),
+                          feedback_state="received",
+                          feedback_age_s=f"{max(0.0, self.clock() - received_at):.6f}",
+                          feedback_source=feedback.source, **feedback.fields())
+
+    def feedback_snapshot(self, joint):
+        """Return state/age/sample; never manufacture a zero sample for an absent motor."""
+
+        if joint not in JOINTS:
+            raise ValueError("joint must be 1..4")
+
+        with self.feedback_lock:
+            feedback = self.latest.get(joint)
+
+        if feedback is None:
+            return "missing", None, None
+
+        age = max(0.0, self.clock() - feedback.received_at)
+
+        return ("stale" if age >= self.stale_s else "fresh"), age, feedback
+
+    def imu_snapshot(self, joint):
+        """Return a locked copy of the familiar per-joint IMU queue and counters."""
+
+        with self.feedback_lock:
+            state = self.imu[joint]
+            samples = list(state.queue)
+            node = state.node
+            counters = {
+                "imu_pairs": node.pairs,
+                "imu_missing": node.missing,
+                "imu_jumps": node.jumps,
+                "imu_rate_hz": node.mean_rate()
+            }
+
+        if not samples:
+            return "missing", None, samples, counters
+
+        age = max(0.0, self.clock() - samples[-1].received_at)
+
+        return "stale" if age >= self.stale_s else "fresh", age, samples, counters
+
+    def show_imu(self, joint, full_queue=False):
+        """Familiar l<n>/q<n> queries, adapted to V3 sequence + raw XYZ payloads."""
+
+        state, age, samples, counters = self.imu_snapshot(joint)
+        prefix = f"joint {joint} ({JOINTS[joint]}) IMU"
+
+        if not samples:
+            self.report(f"{prefix}: MISSING; no complete V3 pair received")
+
+            return
+
+        self.report(f"{prefix}: {state.upper()}, age {age:.3f} s; "
+                    f"pairs={counters['imu_pairs']}, missing={counters['imu_missing']}, "
+                    f"jumps={counters['imu_jumps']}, mean={counters['imu_rate_hz']:.1f} Hz")
+
+        for sample in samples if full_queue else samples[-1:]:
+            ax, ay, az, gx, gy, gz = sample.scaled
+
+            self.report(f"  last received seq={sample.sequence}; "
+                        f"accel g=({ax:.6f}, {ay:.6f}, {az:.6f}); "
+                        f"gyro dps=({gx:.3f}, {gy:.3f}, {gz:.3f})")
+
+    def show_status(self):
+        for joint in JOINTS:
+            self.show_imu(joint)
+            self.show_motor(joint)
+
+        self.report(f"receive socket cumulative drops: {self.socket_drops}")
+
+    def log_status(self):
+        """Record missing/stale explicitly; decoded values occur only on actual RX rows."""
+
+        for joint in JOINTS:
+            state, age, _ = self.feedback_snapshot(joint)
+            imu_state, imu_age, _, counters = self.imu_snapshot(joint)
+
+            self.logger.write("status", **self.identity(joint), feedback_state=state,
+                              feedback_source=self.feedback_source,
+                              feedback_age_s="" if age is None else f"{age:.6f}",
+                              imu_state=imu_state, imu_age_s="" if imu_age is None else f"{imu_age:.6f}",
+                              rx_socket_drops=self.socket_drops, **counters)
+
+    def show_motor(self, joint):
+        state, age, feedback = self.feedback_snapshot(joint)
+        driver = self.motor_map.get(joint)
+        prefix = (f"joint {joint} ({JOINTS[joint]}), motor {driver if driver is not None else 'unassigned'}, {self.feedback_source}")
+
+        if feedback is None:
+            self.report(f"{prefix}: MISSING; no selected motor feedback received")
+
+            return
+
+        self.report(f"{prefix}: {state.upper()}, age {age:.3f} s; last received "
+                    f"position {feedback.position_deg:.1f} deg, speed {feedback.speed_erpm} ERPM, "
+                    f"phase current {feedback.phase_current_a:.2f} A, "
+                    f"driver temperature {feedback.driver_temperature_c} C, "
+                    f"fault {feedback.fault_code} (0x{feedback.fault_code:02X})")
+
+    def _worker_failed(self, error):
+        # Stop occurs here even if the foreground is still blocked in input().
+        with self.command_lock:
+            if self.failure is None:
+                self.failure = error
+
+            self.shutdown.set()
+            self.stop(f"background exception: {error}")
+
+        self.report(f"[FATAL] background worker failed: {error}; stop attempted; press Enter to exit")
+
+    def _refresh_worker(self):
+        try:
+            while not self.shutdown.wait(self.refresh_s):
+                self.refresh_once()
+        except BaseException as error:
+            self._worker_failed(error)
+
+    def _receive_worker(self):
+        next_status = self.clock()
+
+        try:
+            while not self.shutdown.is_set():
+                frame = self.transport.recv()
+
+                if frame is not None:
+                    self.process_frame(frame)
+
+                if self.clock() >= next_status:
+                    self.log_status()
+                    next_status = self.clock() + STATUS_S
+        except BaseException as error:
+            self._worker_failed(error)
+
+    def start(self):
+        """Start both workers after recording the initial missing feedback state."""
+
+        self.log_status()
+
+        for target, name in ((self._refresh_worker, "torque-refresh"), (self._receive_worker, "motor-feedback")):
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    def close(self):
+        """Prevent new sends, cancel refresh, attempt all-joint stop, then close transport."""
+
+        with self.command_lock:
+            if self.closed:
+                return
+
+            self.shutdown.set()
+            errors = self.stop("console shutdown")
+            self.closed = True
+
+            if (errors and self.failure is None):
+                self.failure = RuntimeError("; ".join(errors))
+
+        for thread in self.threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+
+        self.transport.close()
+
+
+HELP = f"""Commands:
+    t <joint> <Nm>  request joint 1..4 torque (limit +/-{TORQUE_LIMIT_NM:.3f} Nm)
+    t_all <Nm>      request all four joints; tall is an alias
+    tstop           clear active requests and send zero to all joints
+    estop           broadcast latched software ESTOP and clear active requests
+    m1 .. m4        display latest selected motor feedback and its age
+    l1 .. l4        display latest complete V3 IMU pair (g, degrees/s)
+    q1 .. q4        display bounded queue of up to 187 complete V3 IMU pairs
+    status          show all IMU/motor states, counts and receive socket drops
+    help            show this help
+    quit            clear active requests, attempt zero on all joints, and exit; exit is an alias
+Active requests refresh every 50 ms by default (firmware command expiry: 200 ms).
+Sent means accepted by the local CAN socket; motor execution is unconfirmed.
+"""
+
+
+def handle_command(console, line):
+    """Validate a complete command before changing requests. Return False on quit."""
+
+    parts = line.strip().lower().split()
+
     if not parts:
         return True
 
-    cmd = parts[0]
+    command = parts[0]
 
-    if cmd in ("quit", "exit"):
+    if (command == "t" and len(parts) == 3):
+        try:
+            joint = int(parts[1])
+            requested = float(parts[2])
+        except ValueError as error:
+            raise CommandError("usage: t <joint 1..4> <finite Nm>") from error
+
+        console.set_torque([joint], requested)
+    elif (command in ("t_all", "tall") and len(parts) == 2):
+        try:
+            requested = float(parts[1])
+        except ValueError as error:
+            raise CommandError("usage: t_all <finite Nm>") from error
+
+        console.set_torque(list(JOINTS), requested)
+    elif (command == "tstop" and len(parts) == 1):
+        if console.stop():
+            raise OSError("one or more stop attempts failed")
+
+        console.report("active requests cleared; zero requests sent to all joints")
+    elif (command == "estop" and len(parts) == 1):
+        if console.stop("operator ESTOP", estop=True):
+            raise OSError("one or more ESTOP/zero attempts failed")
+
+        console.report("software ESTOP sent; active requests cleared; board reset required to unlatch")
+    elif (len(parts) == 1 and command in ("m1", "m2", "m3", "m4")):
+        console.show_motor(int(command[1]))
+    elif (len(parts) == 1 and command in ("l1", "l2", "l3", "l4", "q1", "q2", "q3", "q4")):
+        console.show_imu(int(command[1]), full_queue=command[0] == "q")
+    elif (command == "status" and len(parts) == 1):
+        console.show_status()
+    elif (command in ("help", "h") and len(parts) == 1):
+        console.report(HELP)
+    elif (command in ("quit", "exit") and len(parts) == 1):
         return False
+    else:
+        raise CommandError("invalid command or arguments; type help")
 
-    if cmd == "h":
-        print_help()
-        return True
-
-    if cmd == "estop":
-        can_system.send_estop(bus, can_common.NODE_PI)
-        print("ESTOP broadcast sent")
-        return True
-
-    if cmd == "tstop":
-        for nid, label in NODES.items():
-            if send_torque(bus, nid, 0.0):
-                print(f"  {label}: sent zero torque request")
-        print("zero torque requests attempted on all joints")
-        return True
-
-    if cmd in ("t_all", "tall"):
-        if len(parts) != 2:
-            print("usage: tall <torque_nm>")
-            return True
-        try:
-            torque = float(parts[1])
-        except ValueError:
-            print("torque must be a number")
-            return True
-        if not math.isfinite(torque) or abs(torque) > TORQUE_LIMIT:
-            print(f"torque must be finite within +/-{TORQUE_LIMIT:.3f} Nm")
-            return True
-        for nid, label in NODES.items():
-            if send_torque(bus, nid, torque):
-                print(f"  {label}: sent request {torque:.3f} Nm (execution unconfirmed)")
-        return True
-
-    if cmd == "t":
-        if len(parts) != 3:
-            print("usage: t <node_id> <torque_nm>")
-            return True
-        try:
-            node_id = int(parts[1])
-            torque = float(parts[2])
-        except ValueError:
-            print("node_id must be int, torque must be float")
-            return True
-        if node_id not in NODES:
-            print(f"unknown node {node_id}. valid: {list(NODES.keys())}")
-            return True
-        if not math.isfinite(torque) or abs(torque) > TORQUE_LIMIT:
-            print(f"torque must be finite within +/-{TORQUE_LIMIT:.3f} Nm")
-            return True
-        if send_torque(bus, node_id, torque):
-            iq = torque / KT_EFFECTIVE
-            print(f"sent request {torque:.3f} Nm to {NODES[node_id]} "
-                  f"(nominal {iq:.3f} A; execution unconfirmed)")
-        return True
-
-    kind, node_id = parse_query_command(cmd)
-    if kind == "q":
-        print_full_queue(node_id)
-        return True
-    if kind == "l":
-        print_latest_imu(node_id)
-        return True
-    if kind == "m":
-        print_motor_status(node_id)
-        return True
-
-    print("unknown command, type 'h' for help")
     return True
 
 
-def main():
-    global motor_map, feedback_source
-    parser = argparse.ArgumentParser(description="V3 IMU and torque commissioning console")
-    parser.add_argument("channel", nargs="?", default="can1")
-    parser.add_argument("--feedback-source", choices=can_v3.FEEDBACK_SOURCES,
-                        default="forwarded", help="forwarded PR4 status (default) or raw direct0x29")
-    parser.add_argument("--motor-map", type=can_v3.parse_motor_map,
-                        default=dict(can_v3.DEFAULT_MOTOR_MAP))
-    args = parser.parse_args()
-    channel = args.channel
-    motor_map = args.motor_map
-    feedback_source = args.feedback_source
-
-    print("Exoskeleton V3 SPI IMU + Torque Console")
-    print(f"Motor feedback source: {feedback_source}; configured driver map: {motor_map}")
-    print("PR4 defaults: only node4->107; other nodes need JOINT_MOTOR_ID assignment")
-    print("=" * 50)
-    print(f"CAN interface: {channel}")
-    print("bitrate:       1 Mbit/s (must be configured at the OS level)")
-    print("=" * 50)
+def run_console(console, read_line=input):
+    """Ensure EOF, Ctrl+C, foreground/background errors, and quit all attempt stop."""
 
     try:
-        bus = can_common.create_bus(channel)
-    except (OSError, can.CanError) as e:
-        print(f"[FATAL] cannot open CAN interface '{channel}': {e}")
-        print(f"  hint: sudo ip link set {channel} up type can bitrate 1000000")
-        sys.exit(1)
+        console.start()
 
-    listener = threading.Thread(target=can_listener, args=(bus,), daemon=True)
-    listener.start()
-
-    watchdog = threading.Thread(target=stale_watchdog, daemon=True)
-    watchdog.start()
-
-    print("filling buffers...")
-    sleep(1)
-    print_help()
-
-    try:
-        while True:
+        while not console.shutdown.is_set():
             try:
-                raw = input("> ")
-            except EOFError:
+                line = read_line("> ")
+            except (EOFError, KeyboardInterrupt):
                 break
-            if not handle_command(bus, raw):
+
+            if console.shutdown.is_set():
                 break
-    except KeyboardInterrupt:
-        print("\nCtrl+C: sending ESTOP...")
-        try:
-            can_system.send_estop(bus, can_common.NODE_PI)
-        except can.CanError as e:
-            print(f"failed to send ESTOP: {e}")
+
+            try:
+                if not handle_command(console, line):
+                    break
+            except CommandError as error:
+                console.report(f"[INPUT] {error}")
     finally:
-        try:
-            can_system.send_estop(bus, can_common.NODE_PI)
-        except can.CanError:
-            pass
-        bus.shutdown()
-        print("CAN bus closed")
+        console.close()
+
+    return 1 if console.failure else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "channel",
+        nargs="?",
+        help="Linux SocketCAN interface (default can1); same as --channel"
+    )
+    parser.add_argument(
+        "--channel",
+        dest="channel_option",
+        metavar="CHANNEL",
+        help="Linux SocketCAN interface (default can1)"
+    )
+    parser.add_argument(
+        "--motor-map",
+        type=parse_motor_map,
+        default=dict(DEFAULT_MOTOR_MAP),
+        metavar="1:104,2:105,3:106,4:107",
+        help="joint:motor labels; default follows firmware JOINT_MOTOR_ID defaults; verify physically"
+    )
+    parser.add_argument(
+        "--feedback-source",
+        choices=("forwarded", "direct"),
+        default="forwarded",
+        help="forwarded standard MOTOR_STATUS (default) or raw extended function 0x29"
+    )
+    parser.add_argument(
+        "--out",
+        help="CSV path, created exclusively (default src/pi/logs/motor_log_<UTC time>.csv)"
+    )
+    parser.add_argument(
+        "--refresh-ms",
+        type=float,
+        default=REFRESH_S * 1000,
+        help="Pi torque refresh period, 10..100 ms; default 50"
+    )
+    parser.add_argument(
+        "--stale-ms",
+        type=float,
+        default=STALE_S * 1000,
+        help="age considered stale; default 500 ms"
+    )
+    args = parser.parse_args(argv)
+
+    if (not math.isfinite(args.refresh_ms) or not 10 <= args.refresh_ms <= 100):
+        parser.error("--refresh-ms must be finite and in 10..100 (firmware expiry 200 ms)")
+    if (not math.isfinite(args.stale_ms) or args.stale_ms <= 0):
+        parser.error("--stale-ms must be positive and finite")
+    if (args.channel and args.channel_option and args.channel != args.channel_option):
+        parser.error("give the CAN interface once, positionally or with --channel")
+
+    channel = args.channel_option or args.channel or "can1"
+    out = args.out
+    transport = None
+
+    try:
+        if out is None:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            out = LOG_DIR / datetime.now(timezone.utc).strftime("motor_log_%Y%m%dT%H%M%SZ.csv")
+
+        with open(out, "x", newline="", encoding="utf-8") as output:
+            logger = CSVLog(output)
+            transport = SocketCAN(channel, args.motor_map, args.feedback_source)
+            console = MotorConsole(transport, logger, args.motor_map, args.refresh_ms / 1000,
+                                   args.stale_ms / 1000, feedback_source=args.feedback_source)
+
+            logger.write("session", detail=f"channel={channel}; motor_map={args.motor_map}; "
+                         f"refresh_ms={args.refresh_ms}; firmware_timeout_ms=200; local_refresh_ms=50; "
+                         f"feedback_source={args.feedback_source}; motor map requires hardware verification")
+
+            print(f"Manual torque console, {channel}, 1 Mbit/s (configure interface separately)")
+            print(f"Feedback source: {args.feedback_source}; attribution {args.motor_map}; CSV {out}")
+            print("Labels follow firmware JOINT_MOTOR_ID defaults; boards built with 0 are IMU-only.")
+            print("Motor attribution REQUIRES PHYSICAL VERIFICATION; sent requests do not prove enablement.")
+            print(f"Nominal conversion {KT_NM_PER_A} Nm/A; bench limit +/-5 A = +/-7.155 Nm")
+            print(HELP)
+
+            return run_console(console)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        print(f"[FATAL] {error}", file=sys.stderr)
+
+        return 1
+    finally:
+        if transport is not None:
+            transport.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

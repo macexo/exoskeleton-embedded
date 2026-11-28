@@ -19,9 +19,12 @@ GYRO_DPS_PER_COUNT = 0.070
 PAIR_EXPIRY_S = 0.5
 MAX_PENDING_PAIRS = 32
 MOTOR_STALE_S = 0.5
-# PR4 only assigns right knee by default. Other nodes are IMU-only until the
-# firmware build explicitly sets JOINT_MOTOR_ID; never invent physical routing.
-DEFAULT_MOTOR_MAP = {4: 107}
+# Pi joint -> driver attribution: labels forwarded status and, with
+# --feedback-source direct, selects which drivers' 0x29 feedback is accepted.
+# Mirrors the joint-controller firmware's per-NODE_ID JOINT_MOTOR_ID defaults
+# (left hip 104 ... right knee 107); each board's build, not this map, selects
+# the motor it commands. Override with --motor-map for other builds or IMU-only.
+DEFAULT_MOTOR_MAP = {1: 104, 2: 105, 3: 106, 4: 107}
 MOTOR_STATUS_IDS = {0x100 | (node << 4): node for node in range(1, 5)}
 FEEDBACK_SOURCES = ("forwarded", "direct")
 IMU_IDS = {((kind << 7) | (node << 4)): (node, kind)
