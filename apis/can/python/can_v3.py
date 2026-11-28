@@ -26,6 +26,11 @@ MOTOR_STALE_S = 0.5
 # the motor it commands. Override with --motor-map for other builds or IMU-only.
 DEFAULT_MOTOR_MAP = {1: 104, 2: 105, 3: 106, 4: 107}
 MOTOR_STATUS_IDS = {0x100 | (node << 4): node for node in range(1, 5)}
+# Joint-controller CURRENT_SETPOINT (type 0x6, PR #13): the STM32's requested
+# current after torque conversion and its +/-5 A clamp, sent at 100 Hz.
+CURRENT_SETPOINT_IDS = {(0x6 << 7) | (node << 4): node for node in range(1, 5)}
+# Nominal AK70-9 KV60 conversion (0.159 Nm/A * 9 reduction); not calibration.
+NOMINAL_KT_NM_PER_A = 1.431
 FEEDBACK_SOURCES = ("forwarded", "direct")
 IMU_IDS = {((kind << 7) | (node << 4)): (node, kind)
            for node in range(1, 5) for kind in (3, 4)}
@@ -208,6 +213,21 @@ def decode_motor_feedback(msg, motor_map, source="forwarded"):
         "temperature": temperature,
         "error": fault,
     }
+
+
+def decode_current_setpoint(msg):
+    """Return (node, current_ma) for a joint's CURRENT_SETPOINT frame, else None.
+
+    Standard 0x300 + (node << 4), exactly four data bytes, signed int32
+    little-endian milliamps. Accepts python-can messages or frames with the
+    same fields. This is requested current: not measured phase current, DC
+    supply current, or confirmation that the driver applied the command.
+    """
+
+    if (not _data_frame(msg, False, 4) or msg.arbitration_id not in CURRENT_SETPOINT_IDS):
+        return None
+
+    return CURRENT_SETPOINT_IDS[msg.arbitration_id], struct.unpack("<i", bytes(msg.data))[0]
 
 
 def fresh_motor(motor, now=None):

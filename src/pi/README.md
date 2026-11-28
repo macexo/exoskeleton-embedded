@@ -53,8 +53,21 @@ temperature/fault, and missing/stale ages once per second. Missing feedback is
 not manufactured as zero. Requests are logged even when a joint has no motor
 feedback or label.
 
+Three current columns record different quantities and are never merged:
+
+| Column | Row | Meaning |
+| --- | --- | --- |
+| `requested_current_calc_a` | `command`, `refresh`, `stop`, `send_failed` | Calculated on the Pi: `requested_torque_nm` / `calc_kt_nm_per_a` (nominal 1.431 Nm/A) |
+| `current_setpoint_a` | `current_setpoint` | STM32 requested current after conversion and its ±5 A clamp |
+| `phase_current_a` | `feedback` | Phase current reported by the driver |
+
+A `current_setpoint` row keeps the raw ID, payload, joint and receive time. A
+setpoint is what the STM32 asked for, not proof that the driver applied it, and
+none of these is DC supply current. A board built IMU-only, or running firmware
+without the setpoint frame, logs requests without setpoints.
+
 The console opens its own SocketCAN socket with receive filters for the IMU,
-ESTOP and selected motor-status IDs; live use requires Linux.
+ESTOP, current-setpoint and selected motor-status IDs; live use requires Linux.
 
 ## Current CAN contract
 
@@ -73,6 +86,10 @@ IMU IDs also match the folder’s `can.png` and the working
   The earlier PR revision's `0x09` has been replaced by `0x29` in the latest PR.
 - Torque IDs `081`–`084`: signed int16 little-endian Nm ×1000. ESTOP is `000`.
   PR command expiry is 200 ms; its local motor refresh is 50 ms.
+- Current setpoint IDs `310/320/330/340` (type `0x6`, from
+  [PR #13](https://github.com/macexo/exoskeleton-embedded/pull/13)): standard DLC 4,
+  signed int32 little-endian mA, e.g. +5 A is `88 13 00 00`. Sent at 100 Hz,
+  including zero while idle; `can_v3.decode_current_setpoint` is the shared decoder.
 
 Each board's firmware selects its motor: `JOINT_MOTOR_ID` defaults by `NODE_ID`
 in the joint-controller (`BOARD_JOINT_MOTOR_ID` in sensing's joint-controller-spi),

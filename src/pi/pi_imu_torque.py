@@ -9,11 +9,13 @@ Background workers receive CAN frames and keep active torque requests refreshed:
   - IMU_ACCEL / IMU_GYRO: pair V3 raw XYZ frames per joint and sequence.
   - MOTOR_STATUS: retain the latest STM32-forwarded feedback per joint.
     Direct extended motor feedback is available as an explicit option.
+  - CURRENT_SETPOINT: log each joint's STM32 post-clamp requested current.
   - ESTOP: clear active requests and latch the console's software stop.
   - Torque requests: refresh every 50 ms against the firmware's 200 ms expiry.
 The foreground prompt sends manual requests and queries IMU queues/motor status.
-CSV records raw frames, decoded telemetry and command events; sent requests do
-not confirm motor execution. Quit, EOF and Ctrl+C clear requests and attempt stop.
+CSV records raw frames, decoded telemetry and command events; sent requests and
+STM32 setpoints do not confirm motor execution. Quit, EOF and Ctrl+C clear
+requests and attempt stop.
 
 Setup (run once on the Pi):
     sudo ip link set can1 up type can bitrate 1000000
@@ -60,7 +62,7 @@ DEFAULT_MOTOR_MAP = dict(can_v3.DEFAULT_MOTOR_MAP)
 
 # Nominal torque/current conversion and bench request ceiling; not calibration.
 # The STM32 performs the conversion and applies its own current clamp.
-KT_NM_PER_A = 1.431  # 0.159 Nm/A * 9 reduction.
+KT_NM_PER_A = can_v3.NOMINAL_KT_NM_PER_A  # 1.431 = 0.159 Nm/A * 9 reduction.
 BENCH_CURRENT_LIMIT_A = 5.0
 TORQUE_LIMIT_NM = 7.155  # KT_NM_PER_A * BENCH_CURRENT_LIMIT_A.
 
@@ -88,6 +90,8 @@ SO_RXQ_OVFL = getattr(socket, "SO_RXQ_OVFL", 40)
 ESTOP_REASON = 1
 
 # Stable CSV column order; blank telemetry fields represent unavailable data.
+# Current columns stay separate: Pi-calculated request, STM32 setpoint and
+# driver-reported phase_current_a.
 CSV_COLUMNS = (
     "timestamp_utc", "elapsed_s", "event", "raw_can_id", "arbitration_id",
     "extended", "dlc", "payload_hex", "joint", "joint_name", "motor_id",
@@ -97,6 +101,7 @@ CSV_COLUMNS = (
     "imu_state", "imu_age_s", "ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw",
     "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "imu_pairs", "imu_missing",
     "imu_jumps", "imu_rate_hz", "timestamp_source", "rx_socket_drops", "detail",
+    "requested_current_calc_a", "calc_kt_nm_per_a", "current_setpoint_a",
 )
 
 
@@ -123,6 +128,19 @@ class Frame:
     @property
     def extended(self):
         return bool(self.raw_id & CAN_EFF_FLAG)
+
+    # python-can field names, so shared apis/can/python decoders accept console frames.
+    @property
+    def is_extended_id(self):
+        return self.extended
+
+    @property
+    def is_remote_frame(self):
+        return bool(self.raw_id & CAN_RTR_FLAG)
+
+    @property
+    def is_error_frame(self):
+        return bool(self.raw_id & CAN_ERR_FLAG)
 
 
 @dataclass(frozen=True)
@@ -247,6 +265,7 @@ class SocketCAN:
             standard_mask = CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_SFF_MASK
             standard_ids = [identifier for joint in JOINTS for identifier in imu_ids(joint)]
             standard_ids.append(0)
+            standard_ids.extend(can_v3.CURRENT_SETPOINT_IDS)
 
             if feedback_source == "forwarded":
                 standard_ids.extend(0x100 | (joint << 4) for joint in JOINTS)
@@ -405,15 +424,17 @@ class MotorConsole:
     def _send_torque(self, joint, requested, event):
         frame = torque_frame(joint, requested)
         sent = struct.unpack("<h", frame.data)[0] / 1000.0
+        # Calculated on the Pi from the request; not the STM32 setpoint or measured current.
+        calculated = {"requested_current_calc_a": requested / KT_NM_PER_A, "calc_kt_nm_per_a": KT_NM_PER_A}
 
         try:
             self.transport.send(frame)
         except Exception as error:
-            self.logger.write("send_failed", frame, **self.identity(joint), requested_torque_nm=requested, detail=str(error))
+            self.logger.write("send_failed", frame, **self.identity(joint), requested_torque_nm=requested, **calculated, detail=str(error))
 
             raise
 
-        self.logger.write(event, frame, **self.identity(joint), requested_torque_nm=requested, sent_torque_nm=sent)
+        self.logger.write(event, frame, **self.identity(joint), requested_torque_nm=requested, sent_torque_nm=sent, **calculated)
 
         return sent
 
@@ -545,6 +566,15 @@ class MotorConsole:
                                   imu_pair_state="paired", imu_state="received",
                                   imu_age_s=f"{max(0.0, self.clock() - received_at):.6f}",
                                   **sample.fields())
+
+            return
+
+        setpoint = can_v3.decode_current_setpoint(frame)
+
+        if setpoint is not None:
+            # Requested current only; never refreshes feedback or IMU state.
+            joint, current_ma = setpoint
+            self.logger.write("current_setpoint", frame, **self.identity(joint), current_setpoint_a=current_ma / 1000.0)
 
             return
 
