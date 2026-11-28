@@ -69,6 +69,25 @@ without the setpoint frame, logs requests without setpoints.
 The console opens its own SocketCAN socket with receive filters for the IMU,
 ESTOP, current-setpoint and selected motor-status IDs; live use requires Linux.
 
+## Inference CSV currents
+
+`pi_inference_loop.py` still writes a `src/pi/logs/inference_<UTC>.csv` snapshot
+every 200 ms. Existing columns keep their order and meaning; these follow
+`last_fault`, per joint in `left_hip`, `left_knee`, `right_hip`, `right_knee` order:
+
+| Column | Meaning |
+| --- | --- |
+| `current_calc_kt_nm_per_a` | Nominal 1.431 Nm/A used by the calculated column |
+| `<joint>_raw_pred_current_calc_a` | Raw model prediction (`*_raw`) / 1.431; blank when inference failed |
+| `<joint>_current_setpoint_a` | Latest STM32 setpoint, named as in the joint-controller README |
+| `<joint>_current_setpoint_age_s` | Age of that setpoint; it grows when the 100 Hz frame stops |
+
+Raw predictions are logged even when hips are gated or dry-run is on; `*_nm`
+remains the processed request and `dry_run` shows whether it was transmitted.
+Missing values stay blank rather than zero, and setpoints never mark motor
+feedback or IMUs fresh. Compare `<joint>_current_setpoint_a` with
+`<joint>_motor_phase_current_a`; neither is DC supply current.
+
 ## Current CAN contract
 
 IMU IDs also match the folder’s `can.png` and the working

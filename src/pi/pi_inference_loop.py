@@ -226,6 +226,7 @@ def make_joint_state():
         # fixed 10 ms grid from this buffer.
         "samples":         deque(maxlen=RAW_BUFFER_LEN),
         "motor":           None,
+        "current_setpoint": None,  # (A, monotonic s) of the latest STM32 setpoint
         # Diagnostics: track recent inter-arrival times so we can verify the
         # actual incoming rate at runtime. ~1 s of history is plenty.
         "intervals_ms":    deque(maxlen=256),
@@ -300,6 +301,13 @@ def _process_msg(msg: can.Message):
         node, motor = feedback
         with state_lock:
             joints[node]["motor"] = motor
+        return
+    setpoint = can_v3.decode_current_setpoint(msg)
+    if setpoint is not None:
+        # Requested current only: never motor feedback or IMU liveness.
+        node, current_ma = setpoint
+        with state_lock:
+            joints[node]["current_setpoint"] = (current_ma / 1000.0, time.monotonic())
         return
     if (not msg.is_extended_id and msg.arbitration_id == 0 and msg.dlc == 1
             and len(msg.data) == 1 and not msg.is_remote_frame
@@ -846,6 +854,11 @@ _LOG_COLUMNS = (
                        "motor_phase_current_a", "motor_temp_c", "motor_error",
                        "motor_status", "motor_age_s"])
     + ["last_fault"]
+    # Current comparisons, appended so existing column positions are unchanged.
+    # current_setpoint_a matches the joint-controller README's CSV field name.
+    + ["current_calc_kt_nm_per_a"]
+    + _per_joint_cols(["raw_pred_current_calc_a"])
+    + _per_joint_cols(["current_setpoint_a", "current_setpoint_age_s"])
 )
 
 
@@ -882,6 +895,7 @@ def _log_row() -> list:
                 "imu":      latest_imu,
                 "enc_rad":  latest_enc,
                 "motor":    dict(j["motor"]) if j["motor"] is not None else None,
+                "current_setpoint": j["current_setpoint"],
             }
 
     now = time.monotonic()
@@ -952,6 +966,25 @@ def _log_row() -> list:
             row += [None, None, None, None, None, "missing", None]
 
     row.append(stats["last_fault"])
+
+    # Calculated from the raw prediction, requested by the STM32 and reported by
+    # the driver (motor_phase_current_a): separate quantities, never merged.
+    # Missing values stay blank; the last setpoint is kept with its age.
+    row.append(can_v3.NOMINAL_KT_NM_PER_A)
+    raw_by_node = dict(zip(OUTPUT_NODE_ORDER, raw))
+
+    for nid in _LOG_JOINT_ORDER:
+        predicted = raw_by_node[nid]
+        row.append(predicted / can_v3.NOMINAL_KT_NM_PER_A if predicted is not None else None)
+
+    for nid in _LOG_JOINT_ORDER:
+        current = per_joint[nid]["current_setpoint"]
+
+        if current is None:
+            row += [None, None]
+        else:
+            row += [current[0], f"{max(0.0, now - current[1]):.3f}"]
+
     return row
 
 
