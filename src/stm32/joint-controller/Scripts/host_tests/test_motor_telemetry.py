@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-source = (Path(__file__).resolve().parents[1] / "Core/Src/main.c").read_text()
+source = (Path(__file__).resolve().parents[2] / "Core/Src/main.c").read_text()
 start = source.index("static float requested_current")
 controller = source[start:source.index("/**", start)]
 STUB = r'''

@@ -71,7 +71,7 @@ layout need a compatible SPI decoder.
 
 ## Validation
 
-Run `python src/stm32/joint-controller/tests/test_motor_telemetry.py` with GCC
+Run `python src/stm32/joint-controller/Scripts/host_tests/test_motor_telemetry.py` with GCC
 on PATH for host checks of telemetry timing, byte encoding, conversion/clamping,
 timeout/e-stop zero, mailbox retries, and reset suppression. This uses mocked
 HAL/CAN calls and does not validate physical bus delivery.
